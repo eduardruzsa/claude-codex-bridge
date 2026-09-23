@@ -52,6 +52,28 @@ npm run setup
 
 Then run `cc-bridge doctor`.
 
+### What you'll be asked to allow
+
+**Claude: a development-channel flag.** Custom Claude Channels are a research preview, so Claude Code only loads one when it is started with `--dangerously-load-development-channels`. `claude-live` passes it for you (`claude --dangerously-load-development-channels plugin:cc-bridge@cc-bridge`). The first time, Claude asks you to confirm loading the development channel. The flag enables only this channel. It does not skip tool permissions, and your Claude session keeps asking for approvals as usual.
+
+**Codex: approving the cc-bridge tools.** Codex asks before every MCP tool call, including the bridge's `send_to_claude` and `reply`. To stop being asked, allow the bridge's tools in `~/.codex/config.toml`, under the entry setup created:
+
+```toml
+[mcp_servers.cc-bridge]
+# command and args as written by setup
+default_tools_approval_mode = "approve"
+
+# optional: keep asking before consultations, which use your Claude quota
+[mcp_servers.cc-bridge.tools.consult_claude]
+approval_mode = "prompt"
+```
+
+Without this:
+- With approval policy `never` (and in `codex exec`, which defaults to it), every bridge call is refused.
+- With `approvals_reviewer = "auto_review"`, the automatic reviewer may reject a message whose text includes details from your repository, because it can't verify who receives it. Answer the prompt yourself, or allow the tools as above.
+
+Allowing them only lets Codex send and read bridge messages. The Claude on the other end still asks you before it edits anything or runs commands.
+
 **Updating:** `git pull && npm ci && cc-bridge install`, then restart Codex and any `claude-live` sessions.
 
 ## Daily use
@@ -60,9 +82,9 @@ Then run `cc-bridge doctor`.
    ```sh
    claude-live            # also: claude-live --continue, claude-live --resume <id>
    ```
-   Accept Claude's development-channel prompt when it appears.
+   Accept Claude's development-channel prompt when it appears (see [What you'll be asked to allow](#what-youll-be-asked-to-allow)).
 2. In Claude, say **"ask Codex to review this"**. You don't need to open Codex first:
-   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory and receives the message. Approve its cc-bridge tool calls there.
+   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory and receives the message. Approve its cc-bridge tool calls there, unless you allowed them in the Codex config.
    - **Its paired Codex thread isn't running:** that thread is reopened (`codex resume`) and the message waits for it.
 3. It works the same in the other direction. In Codex, say **"ask Claude …"**:
    - **No connection:** a *new* Claude conversation opens with `claude-live` in Codex's directory, pairs itself and receives the message.

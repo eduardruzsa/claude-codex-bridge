@@ -59,7 +59,8 @@ process.stdin.on('data', d => (input += d)).on('end', () => {
 `, { mode: 0o755 })
 
 fs.writeFileSync(env.CC_BRIDGE_TERMINAL, `#!/usr/bin/env node
-require('fs').appendFileSync(${JSON.stringify(path.join(tmp, 'terminal.log'))}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }) + '\\n')
+const agentVars = Object.keys(process.env).filter(k => /^(CLAUDE|CODEX|CC_BRIDGE_(LABEL|LIFECYCLE_DIR)$)/.test(k)).sort()
+require('fs').appendFileSync(${JSON.stringify(path.join(tmp, 'terminal.log'))}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), agentVars }) + '\\n')
 `, { mode: 0o755 })
 const launched = () => {
   const f = path.join(tmp, 'terminal.log')
@@ -465,7 +466,9 @@ test('Codex with no connection starts a new Claude conversation that pairs itsel
 })
 
 test('Claude with no connection starts a new Codex conversation; it connects and gets the message', async () => {
-  const solo = await startClaude('t10', 'conv-t10')
+  // What Claude Code gives its MCP servers; none of it may reach the new Codex
+  // (its hooks would think they run under Claude, and the token is a secret).
+  const solo = await startClaude('t10', 'conv-t10', { CLAUDE_PROJECT_DIR: tmp, CLAUDECODE: '1', CLAUDE_CODE_MESSAGING_TOKEN: 'secret', CLAUDE_CONFIG_DIR: tmp, CODEX_HOME: tmp })
   await waitFor(() => fs.existsSync(sockFile('t10')))
   const launches = launched().length
   const r1 = await solo.call('send_to_codex', { text: 'first' })
@@ -476,6 +479,7 @@ test('Claude with no connection starts a new Codex conversation; it connects and
   assert.equal(launched().length, launches + 1, 'one terminal, not two')
   const l = (await waitFor(() => launched()[launches]))
   assert.equal(path.basename(l.argv[0]), 'codex')
+  assert.deepEqual(l.agentVars, ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'], 'only user settings, no session of the launching agent')
   assert.match(l.argv[1], /connect_claude tool with project_dir ".*" and session "t10"/)
 
   // The new Codex thread connects as told and receives both messages.
@@ -558,7 +562,7 @@ test('consult_claude: restricted, registry-only resume, original cwd kept', asyn
   assert.ok(!moved.ok)
   assert.match(moved.text, /cwd cannot change/)
 
-  const foreign = await codex.call('consult_claude', { prompt: 'x', session_id: '01184467-e553-4231-8810-02911556b239' })
+  const foreign = await codex.call('consult_claude', { prompt: 'x', session_id: '0000cccc-0000-4000-8000-00000000c003' })
   assert.ok(!foreign.ok)
   assert.match(foreign.text, /not a cc-bridge consultation/)
 
