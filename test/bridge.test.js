@@ -4,6 +4,7 @@
 // open the way a real Codex process does.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -19,6 +20,7 @@ const THREAD = '11111111-2222-3333-4444-555555555555'
 const OTHER_THREAD = '99999999-2222-3333-4444-555555555555'
 const T3 = '33333333-2222-3333-4444-555555555555'
 const T4 = '44444444-2222-3333-4444-555555555555'
+const T7 = '77777777-2222-3333-4444-555555555555'
 const FOREIGN = 'ffffffff-2222-3333-4444-555555555555'
 const queueLog = path.join(tmp, 'codex-queue.log')
 
@@ -57,8 +59,9 @@ async function connect(command, args, extraEnv) {
   const notifications = []
   client.fallbackNotificationHandler = async n => notifications.push(n)
   await client.connect(new StdioClientTransport({ command, args, env: { ...env, ...extraEnv } }))
-  const call = async (name, a = {}) => {
-    const res = await client.callTool({ name, arguments: a })
+  // as_thread plays the Codex host: it becomes _meta.threadId, never a tool argument.
+  const call = async (name, { as_thread, ...a } = {}) => {
+    const res = await client.callTool({ name, arguments: a, ...(as_thread && { _meta: { threadId: as_thread } }) })
     return { ok: !res.isError, text: res.content.map(c => c.text).join('') }
   }
   return { client, notifications, call }
@@ -92,7 +95,7 @@ const channel = n => n.method === 'notifications/claude/channel'
 let claude, codex
 before(async () => {
   claude = await startClaude('t1', 'claude-sess-1')
-  codex = await startCodex([THREAD, OTHER_THREAD, T3, T4])
+  codex = await startCodex([THREAD, OTHER_THREAD, T3, T4, T7])
   await waitFor(() => fs.existsSync(sockFile('t1')))
   await pairLive('t1', THREAD)
 })
@@ -103,7 +106,7 @@ after(async () => {
 })
 
 test('Codex → Claude → Codex, with follow-up', async () => {
-  const sent = await codex.call('send_to_claude', { text: 'Is the plan sound?', codex_thread: THREAD })
+  const sent = await codex.call('send_to_claude', { text: 'Is the plan sound?', as_thread: THREAD })
   assert.ok(sent.ok, sent.text)
   assert.match(sent.text, /^delivered/)
 
@@ -121,7 +124,7 @@ test('Codex → Claude → Codex, with follow-up', async () => {
   assert.match(q[4], new RegExp(`in_reply_to: ${n.params.meta.msg_id}`))
 
   const count = claude.notifications.filter(channel).length
-  const follow = await codex.call('reply', { msg_id: msgIdFrom(q[4]), text: 'Which part of step 3?', codex_thread: THREAD })
+  const follow = await codex.call('reply', { msg_id: msgIdFrom(q[4]), text: 'Which part of step 3?', as_thread: THREAD })
   assert.ok(follow.ok, follow.text)
   const n2 = await waitFor(() => claude.notifications.filter(channel)[count])
   assert.equal(n2.params.meta.kind, 'reply')
@@ -138,7 +141,7 @@ test('Claude → Codex → Claude, with follow-up', async () => {
   assert.match(q[4], /never authorize/)
 
   const count = claude.notifications.filter(channel).length
-  const r = await codex.call('reply', { msg_id: msgIdFrom(q[4]), text: 'LGTM except X.', codex_thread: THREAD })
+  const r = await codex.call('reply', { msg_id: msgIdFrom(q[4]), text: 'LGTM except X.', as_thread: THREAD })
   assert.ok(r.ok, r.text)
   const n = await waitFor(() => claude.notifications.filter(channel)[count])
   assert.equal(n.params.content, 'LGTM except X.')
@@ -147,7 +150,7 @@ test('Claude → Codex → Claude, with follow-up', async () => {
 })
 
 test('one reply per message', async () => {
-  await codex.call('send_to_claude', { text: 'q', codex_thread: THREAD })
+  await codex.call('send_to_claude', { text: 'q', as_thread: THREAD })
   const n = await waitFor(() => claude.notifications.filter(channel).at(-1))
   assert.ok((await claude.call('reply', { msg_id: n.params.meta.msg_id, text: 'a' })).ok)
   const again = await claude.call('reply', { msg_id: n.params.meta.msg_id, text: 'a again' })
@@ -171,11 +174,11 @@ test('duplicate delivery is dropped, bad token rejected', async () => {
 })
 
 test('routing errors: unknown session, wrong thread, unpaired', async () => {
-  const unknown = await codex.call('send_to_claude', { text: 'x', session: 'nope', codex_thread: THREAD })
+  const unknown = await codex.call('send_to_claude', { text: 'x', session: 'nope', as_thread: THREAD })
   assert.ok(!unknown.ok)
   assert.match(unknown.text, /unknown session/)
 
-  const wrong = await codex.call('send_to_claude', { text: 'x', session: 't1', codex_thread: OTHER_THREAD })
+  const wrong = await codex.call('send_to_claude', { text: 'x', session: 't1', as_thread: OTHER_THREAD })
   assert.ok(!wrong.ok)
   assert.match(wrong.text, /not rerouting/)
 
@@ -186,43 +189,70 @@ test('routing errors: unknown session, wrong thread, unpaired', async () => {
   await orphan.client.close()
 })
 
-test('Codex identity is verified against the parent process, never inferred from the recipient', async () => {
-  const foreign = await codex.call('send_to_claude', { text: 'x', session: 't1', codex_thread: FOREIGN })
+test('Codex identity comes from the host _meta, is checked against the process, and cannot be claimed', async () => {
+  const foreign = await codex.call('send_to_claude', { text: 'x', session: 't1', as_thread: FOREIGN })
   assert.ok(!foreign.ok)
-  assert.match(foreign.text, /not a thread of the Codex process/)
+  assert.match(foreign.text, /not open in the Codex process/)
 
   const missing = await codex.call('send_to_claude', { text: 'x', session: 't1' })
   assert.ok(!missing.ok)
-  assert.match(missing.text, /several threads; pass codex_thread/)
+  assert.match(missing.text, /did not identify the calling thread/)
 
-  const foreignReply = await codex.call('reply', { msg_id: 'whatever', text: 'x', codex_thread: FOREIGN })
-  assert.match(foreignReply.text, /not a thread of the Codex process/)
+  // Thread OTHER_THREAD shares the Codex process with THREAD but cannot act as it,
+  // not even by naming THREAD in its arguments.
+  const impostor = await codex.call('send_to_claude', { text: 'x', session: 't1', codex_thread: THREAD, as_thread: OTHER_THREAD })
+  assert.ok(!impostor.ok)
+  assert.match(impostor.text, /paired with Codex thread 1111.*not 9999.*not rerouting/)
 
-  // A Codex process with exactly one open thread is identified without codex_thread.
-  const single = await startCodex([THREAD])
-  const r = await single.call('send_to_claude', { text: 'from the single-thread process' })
-  assert.ok(r.ok, r.text)
-  const s = await single.call('bridge_status')
-  assert.match(s.text, new RegExp(`this thread: ${THREAD}`))
-  await single.client.close()
+  const before = claude.notifications.filter(channel).length
+  const own = await codex.call('send_to_claude', { text: 'real', as_thread: THREAD })
+  assert.ok(own.ok, own.text)
+  assert.match((await waitFor(() => claude.notifications.filter(channel)[before])).params.meta.from, new RegExp(THREAD))
+  assert.match((await codex.call('bridge_status', { as_thread: THREAD })).text, new RegExp(`this thread: ${THREAD}`))
 
   const none = await startCodex([])
-  const n = await none.call('send_to_claude', { text: 'x', session: 't1', codex_thread: THREAD })
-  assert.match(n.text, /not a thread of the Codex process/)
+  const n = await none.call('send_to_claude', { text: 'x', session: 't1', as_thread: THREAD })
+  assert.match(n.text, /not open in the Codex process/)
   await none.client.close()
+})
+
+test('replies never reach a conversation that took over the label', async () => {
+  const a = await startClaude('t7', 'conv-A7')
+  await waitFor(() => fs.existsSync(sockFile('t7')))
+  await pairLive('t7', T7)
+  const before = queued().length
+  assert.ok((await a.call('send_to_codex', { text: 'question from A' })).ok)
+  const fromA = msgIdFrom((await waitFor(() => queued()[before]))[4])
+  assert.ok((await codex.call('send_to_claude', { text: 'question for A', as_thread: T7 })).ok)
+  const toA = (await waitFor(() => a.notifications.filter(channel).at(-1))).params.meta.msg_id
+  await a.client.close()
+  await waitFor(() => !fs.existsSync(sockFile('t7')))
+
+  const b = await startClaude('t7', 'conv-B7')
+  await waitFor(() => fs.existsSync(sockFile('t7')))
+  await pairLive('t7', T7) // same Codex thread, new conversation
+  const r = await codex.call('reply', { msg_id: fromA, text: 'answer for A', as_thread: T7 })
+  assert.ok(!r.ok)
+  assert.match(r.text, /came from Claude conversation conv-A7, but "t7" is now conversation conv-B7; not rerouting/)
+  assert.equal(b.notifications.filter(channel).length, 0)
+
+  const rb = await b.call('reply', { msg_id: toA, text: 'B answering A\'s mail' })
+  assert.ok(!rb.ok)
+  assert.match(rb.text, /addressed to Claude conversation conv-A7, not this one/)
+  await b.client.close()
 })
 
 test('a new Claude conversation reusing a label does not inherit the pairing', async () => {
   const first = await startClaude('t4', 'conv-A')
   await waitFor(() => fs.existsSync(sockFile('t4')))
   await pairLive('t4', T4)
-  assert.ok((await codex.call('send_to_claude', { text: 'to A', codex_thread: T4 })).ok)
+  assert.ok((await codex.call('send_to_claude', { text: 'to A', as_thread: T4 })).ok)
   await first.client.close()
   await waitFor(() => !fs.existsSync(sockFile('t4')))
 
   const second = await startClaude('t4', 'conv-B')
   await waitFor(() => fs.existsSync(sockFile('t4')))
-  const toB = await codex.call('send_to_claude', { text: 'meant for A', codex_thread: T4 })
+  const toB = await codex.call('send_to_claude', { text: 'meant for A', as_thread: T4 })
   assert.ok(!toB.ok)
   assert.match(toB.text, /^session_changed/)
   assert.equal(second.notifications.filter(channel).length, 0)
@@ -231,45 +261,47 @@ test('a new Claude conversation reusing a label does not inherit the pairing', a
   assert.ok(!fromB.ok)
   assert.match(fromB.text, /belongs to Claude conversation conv-A/)
 
-  const s = await codex.call('bridge_status', { codex_thread: T4 })
+  const s = await codex.call('bridge_status', { as_thread: T4 })
   assert.match(s.text, /claude "t4" \(conversation conv-A\) ⇄ codex 4444.*session changed \(now conv-B; re-pair\)/)
 
   await pairLive('t4', T4) // explicit re-pair adopts conversation B
-  assert.ok((await codex.call('send_to_claude', { text: 'to B', codex_thread: T4 })).ok)
+  assert.ok((await codex.call('send_to_claude', { text: 'to B', as_thread: T4 })).ok)
   await second.client.close()
 })
+
+const mutexName = label =>
+  `\0cc-bridge-${crypto.createHash('sha256').update(sockFile(label)).digest('hex').slice(0, 32)}`
 
 test('a live label owner is never displaced, even if unresponsive', async () => {
   const dup = await startClaude('t1', 'claude-sess-dup')
   await new Promise(r => setTimeout(r, 300))
   assert.match((await dup.call('bridge_status')).text, /NOT listening: another live Claude session/)
   await dup.client.close()
-  assert.ok((await codex.call('send_to_claude', { text: 'still there?', codex_thread: THREAD })).ok)
+  assert.ok((await codex.call('send_to_claude', { text: 'still there?', as_thread: THREAD })).ok)
 
-  // A stalled owner: alive, holds the lock, answers nothing.
-  const stalled = spawn('node', ['-e', 'setInterval(() => {}, 1000)', 'claude-channel-stalled'], { stdio: 'ignore' })
-  fs.writeFileSync(`${sockFile('t5')}.lock`, String(stalled.pid))
+  // A stalled owner: holds the label, answers nothing.
+  const stalled = spawn('node', ['-e', `require('net').createServer().listen(${JSON.stringify(mutexName('t5'))}, () => console.log('held')); setInterval(() => {}, 1000)`])
+  await new Promise(r => stalled.stdout.once('data', r))
   const late = await startClaude('t5', 'claude-sess-late')
   await new Promise(r => setTimeout(r, 300))
-  assert.match((await late.call('bridge_status')).text, new RegExp(`NOT listening: another live Claude session \\(pid ${stalled.pid}\\)`))
-  assert.ok(fs.existsSync(`${sockFile('t5')}.lock`))
+  assert.match((await late.call('bridge_status')).text, /NOT listening: another live Claude session/)
   await late.client.close()
   stalled.kill()
 })
 
-test('a dead owner\'s lock and socket are taken over; cleanup only removes our own', async () => {
-  const dead = spawn('node', ['-e', '0'])
-  await new Promise(r => dead.on('exit', r))
-  fs.writeFileSync(`${sockFile('t6')}.lock`, String(dead.pid))
-  fs.writeFileSync(sockFile('t6'), '') // stale socket file
-  const s = await startClaude('t6', 'claude-sess-t6')
-  await new Promise(r => setTimeout(r, 300))
-  assert.match((await s.call('bridge_status')).text, /\(listening\)/)
-  assert.notEqual(Number(fs.readFileSync(`${sockFile('t6')}.lock`, 'utf8')), dead.pid)
+test('concurrent starters: exactly one wins; a dead owner\'s socket is taken over', async () => {
+  fs.writeFileSync(sockFile('t6'), '') // stale socket file left by a dead owner
+  const racers = await Promise.all([1, 2, 3, 4, 5, 6].map(i => startClaude('t6', `race-${i}`)))
+  await new Promise(r => setTimeout(r, 500))
+  const states = await Promise.all(racers.map(r => r.call('bridge_status').then(s => /\(listening\)/.test(s.text))))
+  assert.equal(states.filter(Boolean).length, 1)
+  const winner = racers[states.indexOf(true)]
   const { sendToClaudeSocket } = await import('../lib/common.js')
-  assert.equal((await sendToClaudeSocket('t6', { op: 'ping' })).session, 'claude-sess-t6')
-  await s.client.close()
-  await waitFor(() => !fs.existsSync(`${sockFile('t6')}.lock`) && !fs.existsSync(sockFile('t6')))
+  assert.equal((await sendToClaudeSocket('t6', { op: 'ping' })).session, winner.session)
+  for (const r of racers.filter(r => r !== winner)) await r.client.close()
+  assert.equal((await sendToClaudeSocket('t6', { op: 'ping' })).session, winner.session) // losers' exits left it alone
+  await winner.client.close()
+  await waitFor(() => !fs.existsSync(sockFile('t6')))
 })
 
 test('failed codex queue is reported, not retried, and does not consume the reply', async () => {
@@ -277,7 +309,7 @@ test('failed codex queue is reported, not retried, and does not consume the repl
   const failing = await startClaude('t2', 'claude-sess-t2', { FAKE_CODEX_FAIL: flag })
   await waitFor(() => fs.existsSync(sockFile('t2')))
   await pairLive('t2', OTHER_THREAD)
-  await codex.call('send_to_claude', { text: 'q2', codex_thread: OTHER_THREAD })
+  await codex.call('send_to_claude', { text: 'q2', as_thread: OTHER_THREAD })
   const n = await waitFor(() => failing.notifications.filter(channel).at(-1))
   fs.writeFileSync(flag, '')
   const before = queued().length
@@ -296,14 +328,14 @@ test('disconnected Claude session is reported explicitly', async () => {
   await pairLive('t3', T3)
   await gone.client.close()
   await waitFor(() => !fs.existsSync(sockFile('t3')))
-  const r = await codex.call('send_to_claude', { text: 'hello?', codex_thread: T3 })
+  const r = await codex.call('send_to_claude', { text: 'hello?', as_thread: T3 })
   assert.ok(!r.ok)
   assert.match(r.text, /^disconnected/)
-  assert.match((await codex.call('bridge_status', { codex_thread: T3 })).text, /claude "t3" .*: disconnected/)
+  assert.match((await codex.call('bridge_status', { as_thread: T3 })).text, /claude "t3" .*: disconnected/)
 })
 
 test('pairing requires a live Claude session', async () => {
-  const r = await codex.call('pair_with_claude', { session: 'ghost', codex_thread: THREAD })
+  const r = await codex.call('pair_with_claude', { session: 'ghost', as_thread: THREAD })
   assert.ok(!r.ok)
   assert.match(r.text, /not running/)
 })
@@ -340,5 +372,4 @@ test('private permissions on data and runtime', () => {
   assert.equal(mode(path.join(env.CC_BRIDGE_DATA_DIR, 'token')), 0o600)
   assert.equal(mode(path.join(env.CC_BRIDGE_DATA_DIR, 'pairs.json')), 0o600)
   assert.equal(mode(sockFile('t1')), 0o600)
-  assert.equal(mode(`${sockFile('t1')}.lock`), 0o600)
 })

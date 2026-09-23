@@ -13,6 +13,7 @@ import {
   codexParty,
   consultArgs,
   findMessage,
+  isUuid,
   labelForThread,
   loadConsultations,
   loadPairs,
@@ -29,11 +30,6 @@ import { deliverToClaude } from './lib/deliver.js'
 const CONSULT_TIMEOUT_MS = 10 * 60 * 1000
 const claudeBin = () => process.env.CC_BRIDGE_CLAUDE_BIN || 'claude'
 
-const THREAD_ARG = {
-  type: 'string',
-  description: 'Your Codex thread id: run `echo $CODEX_THREAD_ID` once and pass it on every cc-bridge call. It is verified against the threads of the Codex process that launched this server.',
-}
-
 const TOOLS = [
   {
     name: 'send_to_claude',
@@ -43,7 +39,6 @@ const TOOLS = [
       properties: {
         text: { type: 'string', description: 'The question or message for Claude' },
         session: { type: 'string', description: 'Claude session label; defaults to the one paired with this thread' },
-        codex_thread: THREAD_ARG,
       },
       required: ['text'],
     },
@@ -56,7 +51,6 @@ const TOOLS = [
       properties: {
         msg_id: { type: 'string', description: 'The msg_id line of the Claude message being answered' },
         text: { type: 'string' },
-        codex_thread: THREAD_ARG,
       },
       required: ['msg_id', 'text'],
     },
@@ -64,14 +58,14 @@ const TOOLS = [
   {
     name: 'bridge_status',
     description: 'List Claude sessions paired with Codex threads, whether each is connected, and recent bridge messages.',
-    inputSchema: { type: 'object', properties: { codex_thread: THREAD_ARG } },
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'pair_with_claude',
     description: 'Pair this Codex thread with a live Claude session label (one-to-one; replaces any previous pairing of either side).',
     inputSchema: {
       type: 'object',
-      properties: { session: { type: 'string', description: 'Claude session label (CC_BRIDGE_LABEL, default "claude")' }, codex_thread: THREAD_ARG },
+      properties: { session: { type: 'string', description: 'Claude session label (CC_BRIDGE_LABEL, default "claude")' } },
       required: ['session'],
     },
   },
@@ -99,9 +93,9 @@ const TOOLS = [
 const text = t => ({ content: [{ type: 'text', text: t }] })
 const fail = t => ({ content: [{ type: 'text', text: t }], isError: true })
 
-// Codex thread identity, verified rather than trusted: the Codex process that
-// launched this server keeps each of its threads' rollout-<ts>-<uuid>.jsonl open.
-// (Codex doesn't pass CODEX_THREAD_ID to MCP servers, so the agent supplies it.)
+// Codex thread identity comes from the Codex host, not the model: every tools/call
+// carries _meta.threadId for the calling thread. As a second check it must be a thread
+// whose rollout-<ts>-<uuid>.jsonl the Codex process that launched us holds open.
 function openCodexThreads() {
   const threads = new Set()
   const fdDir = `/proc/${process.ppid}/fd`
@@ -120,24 +114,14 @@ function openCodexThreads() {
   return threads
 }
 
-function verifiedThread(args) {
-  const env = process.env.CODEX_THREAD_ID
-  const claimed = args.codex_thread?.toLowerCase()
-  if (env && claimed && env.toLowerCase() !== claimed) throw new Error(`codex_thread ${claimed} does not match CODEX_THREAD_ID ${env}`)
-  const threads = openCodexThreads()
-  const wanted = claimed || env?.toLowerCase()
-  if (wanted) {
-    if (!threads.has(wanted)) throw new Error(`codex_thread ${wanted} is not a thread of the Codex process running this bridge`)
-    return wanted
-  }
-  if (threads.size === 1) return [...threads][0]
-  throw new Error(threads.size
-    ? 'this Codex process has several threads; pass codex_thread (run: echo $CODEX_THREAD_ID)'
-    : 'cannot verify which Codex thread this is (no open Codex thread found); pass codex_thread from a Codex session')
+function callerThread(meta) {
+  const t = String(meta?.threadId || meta?.['x-codex-turn-metadata']?.thread_id || '').toLowerCase()
+  if (!isUuid(t)) throw new Error('Codex did not identify the calling thread (no _meta.threadId on the tool call)')
+  if (!openCodexThreads().has(t)) throw new Error(`calling thread ${t} is not open in the Codex process running this bridge`)
+  return t
 }
 
-async function sendToClaude(args) {
-  const thread = verifiedThread(args)
+async function sendToClaude(args, thread) {
   const label = args.session || labelForThread(thread)
   if (!label) return fail('unknown session: this thread is not paired with a Claude session. Use pair_with_claude.')
   if (!validLabel(label)) return fail(`unknown session: invalid label "${label}"`)
@@ -151,8 +135,7 @@ async function sendToClaude(args) {
   return fail(`${res.status}: Claude session "${label}" did not receive msg_id ${res.msg_id}${res.error ? ` (${res.error})` : ''}. Not retried.`)
 }
 
-async function replyToClaude(args) {
-  const thread = verifiedThread(args)
+async function replyToClaude(args, thread) {
   const events = readTranscript()
   const original = findMessage(args.msg_id, events)
   if (!original) return fail(`unknown msg_id ${args.msg_id}`)
@@ -161,16 +144,19 @@ async function replyToClaude(args) {
   if (side !== 'claude') return fail(`msg_id ${args.msg_id} did not come from Claude`)
   const pair = loadPairs()[label]
   if (pair?.codex !== thread) return fail(`Claude session "${label}" is no longer paired with thread ${thread}; not rerouting`)
+  if (pair.claude_session !== original.claude_session) {
+    return fail(`msg_id ${args.msg_id} came from Claude conversation ${original.claude_session}, but "${label}" is now conversation ${pair.claude_session}; not rerouting`)
+  }
   const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: String(args.text || ''), replyToId: original.msg_id, kind: 'reply' })
   if (res.status === 'delivered') return text(`reply delivered to Claude session "${label}" (msg_id ${res.msg_id}).`)
   return fail(`${res.status}: reply msg_id ${res.msg_id} not delivered to Claude session "${label}"${res.error ? ` (${res.error})` : ''}. Not retried.`)
 }
 
-async function status(args) {
+async function status(meta) {
   const pairs = Object.entries(loadPairs())
   let me
   try {
-    me = verifiedThread(args)
+    me = callerThread(meta)
   } catch (err) {
     me = `unverified (${err.message})`
   }
@@ -238,7 +224,7 @@ const mcp = new Server(
   {
     capabilities: { tools: {} },
     instructions:
-      'cc-bridge connects this Codex thread to a live Claude Code session. Claude messages arrive as ' +
+      'cc-bridge connects this Codex thread to a live Claude Code session (Codex identifies the calling thread automatically). Claude messages arrive as ' +
       '"[cc-bridge message|reply from Claude session ...]" with a msg_id; answer with `reply`. Start exchanges ' +
       `with \`send_to_claude\`. Your ordinary output is NOT forwarded to Claude. ${RULES} ` +
       '`consult_claude` is a separate read-only Claude, independent of the live session.',
@@ -249,16 +235,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = req.params.arguments || {}
+  const meta = req.params._meta
   try {
     switch (req.params.name) {
       case 'send_to_claude':
-        return await sendToClaude(args)
+        return await sendToClaude(args, callerThread(meta))
       case 'reply':
-        return await replyToClaude(args)
+        return await replyToClaude(args, callerThread(meta))
       case 'bridge_status':
-        return await status(args)
+        return await status(meta)
       case 'pair_with_claude': {
-        const thread = verifiedThread(args)
+        const thread = callerThread(meta)
         const { pair, replaced } = await pairLive(String(args.session), thread)
         return text(`paired Claude session "${args.session}" (conversation ${pair.claude_session}) ⇄ Codex thread ${thread}` +
           (replaced.length ? `\nreplaced: ${replaced.map(r => `"${r.claude}" ⇄ ${r.codex}`).join(', ')}` : ''))

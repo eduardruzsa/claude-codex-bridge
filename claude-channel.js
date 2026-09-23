@@ -3,6 +3,7 @@
 // Launched by Claude Code over stdio (see bin/claude-live). Codex messages
 // arrive on a user-only Unix socket and are pushed into the session as
 // <channel source="cc-bridge" ...> events.
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -92,7 +93,7 @@ function myPair() {
 async function sendToPairedCodex(body, replyToId, kind) {
   if (!listening) return fail(`bridge is not listening: ${listenError}`)
   const thread = myPair().codex
-  const res = await deliverToCodex({ fromLabel: label, thread, text: body, replyToId, kind })
+  const res = await deliverToCodex({ fromLabel: label, claudeSession: mySession, thread, text: body, replyToId, kind })
   if (res.status !== 'queued') return fail(`not delivered to Codex thread ${thread}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
   return text(`queued for Codex thread ${thread} (msg_id ${res.msg_id}). Its answer, if any, arrives later as a channel event.`)
 }
@@ -108,6 +109,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const original = validateReply(String(args.msg_id), me)
         if (parseParty(original.from).side !== 'codex') return fail(`msg_id ${args.msg_id} did not come from Codex`)
+        if (original.claude_session !== mySession) return fail(`msg_id ${args.msg_id} was addressed to Claude conversation ${original.claude_session}, not this one`)
         const paired = myPair().codex
         const origThread = parseParty(original.from).id
         if (paired !== origThread) return fail(`msg_id ${args.msg_id} came from Codex thread ${origThread}, but this session is now paired with ${paired}; not rerouting`)
@@ -190,57 +192,36 @@ function serve(conn) {
   conn.on('error', () => {})
 }
 
-// Exclusive ownership: a lock file holding our pid. A socket is only replaced when
-// the lock's owner is provably gone, never because a live owner was slow to answer.
-function lockOwnerAlive(pid) {
-  try {
-    process.kill(pid, 0)
-  } catch (err) {
-    if (err.code === 'ESRCH') return false
-  }
-  try {
-    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude-channel')
-  } catch {
-    return true // can't inspect it; assume alive rather than steal
-  }
-}
-
-function acquireLock(lockPath) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      fs.writeFileSync(lockPath, String(process.pid), { mode: 0o600, flag: 'wx' })
-      return
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err
-    }
-    const owner = Number(fs.readFileSync(lockPath, 'utf8'))
-    if (owner && lockOwnerAlive(owner)) {
-      throw new Error(`another live Claude session (pid ${owner}) already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
-    }
-    fs.unlinkSync(lockPath) // owner is gone; one retry, and 'wx' lets only one racer win
-  }
-  throw new Error(`could not take the lock for label "${label}"`)
+// Exclusive ownership of the label: a Linux abstract-namespace socket bound only as a
+// mutex. The kernel allows one binder and releases it when the process dies, so there
+// is no stale lock to recover and no read-then-delete race. Whoever holds it may
+// replace the (then necessarily stale) socket file; our exit cleanup runs while we
+// still hold it, so it can never remove a successor's socket.
+function acquireLabel(sockPath) {
+  const key = crypto.createHash('sha256').update(sockPath).digest('hex').slice(0, 32)
+  const mutex = net.createServer(c => c.destroy())
+  return new Promise((resolve, reject) => {
+    mutex.once('error', err =>
+      reject(err.code === 'EADDRINUSE'
+        ? new Error(`another live Claude session already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
+        : err))
+    mutex.listen(`\0cc-bridge-${key}`, resolve)
+  })
 }
 
 async function listen() {
   if (!mySession) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
   const sockPath = paths.socket(label)
-  const lockPath = `${sockPath}.lock`
-  acquireLock(lockPath)
-  const release = () => {
+  await acquireLabel(sockPath)
+  process.on('exit', () => {
     try {
-      if (Number(fs.readFileSync(lockPath, 'utf8')) !== process.pid) return
       fs.unlinkSync(sockPath)
     } catch {}
-    try {
-      fs.unlinkSync(lockPath)
-    } catch {}
-  }
-  process.on('exit', release)
+  })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0))
   process.stdin.on('close', () => process.exit(0))
   try {
-    fs.unlinkSync(sockPath) // we hold the lock, so any socket here is stale
+    fs.unlinkSync(sockPath) // we own the label, so any socket file here is stale
   } catch {}
   const server = net.createServer(serve)
   await new Promise((resolve, reject) => {

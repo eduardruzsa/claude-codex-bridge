@@ -31,7 +31,7 @@ ln -s ~/Work/claude-codex-bridge/bin/cc-bridge ~/.local/bin/cc-bridge
 2. In Codex, restart the session or reload MCP so the `cc-bridge` tools appear. Then ask it to pair:
    > Pair with Claude session "claude" using cc-bridge.
 
-   Codex runs `echo $CODEX_THREAD_ID` and calls `pair_with_claude`. The pairing binds that exact Claude conversation (`CLAUDE_CODE_SESSION_ID`). A later conversation that reuses the label has to be paired again. You can also pair by hand while `claude-live` is running:
+   Codex calls `pair_with_claude`, and Codex itself tells the bridge which thread is calling. The pairing binds that exact Claude conversation (`CLAUDE_CODE_SESSION_ID`). A later conversation that reuses the label has to be paired again. You can also pair by hand while `claude-live` is running:
    ```
    cc-bridge pair --claude claude --codex <thread-uuid>
    ```
@@ -50,16 +50,17 @@ cc-bridge log -n 20     # transcript with delivery status
 
 | Claude (live channel) | Codex |
 |---|---|
-| `send_to_codex(text)` | `send_to_claude(text, session?, codex_thread)` |
-| `reply(msg_id, text)` | `reply(msg_id, text, codex_thread)` |
-| `bridge_status()` | `bridge_status()`, `pair_with_claude(session, codex_thread)` |
+| `send_to_codex(text)` | `send_to_claude(text, session?)` |
+| `reply(msg_id, text)` | `reply(msg_id, text)` |
+| `bridge_status()` | `bridge_status()`, `pair_with_claude(session)` |
 | | `consult_claude(prompt, session_id?, label?, cwd?)`, `list_consultations()` |
 
 ## Guarantees
 
 - **Addressing:** pairings are one-to-one between a Claude conversation (its label plus `CLAUDE_CODE_SESSION_ID`) and a Codex thread UUID. A message goes only to its paired conversation and is never rerouted. If the label now belongs to a different conversation, the send fails with `session_changed`.
-- **Verified Codex identity:** the `codex_thread` a Codex agent passes must be one of the threads whose `rollout-*.jsonl` the parent Codex process has open (`/proc/<ppid>/fd`). The bridge never infers a thread from the recipient.
-- **Socket ownership:** each label is owned through a PID lock file. A socket is replaced only when its owner process is gone, never because the owner was slow to answer, and cleanup removes only the process's own socket.
+- **Replies stay with their conversation:** every message records its Claude conversation. A reply to a message from an earlier conversation is refused, even when the label and Codex thread have since been re-paired.
+- **Codex identity:** the host-set `_meta.threadId` on each tool call identifies the calling Codex thread. The model can't set it. The bridge also checks that the thread's `rollout-*.jsonl` is open in the parent Codex process. Two threads sharing one Codex process can't act as each other.
+- **Socket ownership:** a Linux abstract-namespace socket acts as the lock for each label. Only one process can bind it, and the kernel releases it when that process dies. That leaves no stale lock to recover and no race between two starting processes. A socket file is replaced only by the new owner, and cleanup can't remove a successor's socket.
 - **Consultations:** a follow-up can resume only a `session_id` this bridge created, and always runs in that consultation's original directory.
 - **Delivery status:** sends are asynchronous. Codex-bound messages report `queued`; Claude-bound messages report `delivered`, `disconnected`, `unknown session` or `timeout`. Failed sends are never retried automatically.
 - **Loop limits:** each message accepts one reply, an exchange is capped at 20 messages, and duplicate `msg_id`s are dropped. Tool descriptions tell both agents not to send acknowledgement-only replies.
@@ -69,7 +70,7 @@ cc-bridge log -n 20     # transcript with delivery status
 
 ## Quirks
 
-- Codex removes `XDG_RUNTIME_DIR` and `CODEX_THREAD_ID` from MCP server environments. The bridge falls back to `/run/user/<uid>`. Codex passes `codex_thread` explicitly, and the bridge checks it against the parent process. It may be omitted only when the Codex process has exactly one thread open.
+- Codex removes `XDG_RUNTIME_DIR` from MCP server environments, so the bridge falls back to `/run/user/<uid>`.
 - A Claude `/clear` inside the same process keeps the MCP server running with the old conversation id, so re-pair after `/clear`.
 - A Codex thread handles queued messages at its next turn boundary. An idle Codex TUI picks them up immediately; a closed thread picks them up when resumed.
 - Custom channels are a research-preview Claude Code feature and require `--dangerously-load-development-channels`. That flag skips only the channel allowlist. Tool permissions are unchanged.
