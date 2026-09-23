@@ -13,7 +13,6 @@ import {
   claudeParty,
   codexParty,
   formatForCodex,
-  newId,
   record,
   sendToClaudeSocket,
   consultArgs,
@@ -23,7 +22,6 @@ import {
   loadConsultations,
   loadPairs,
   pairLive,
-  pairState,
   parseParty,
   readTranscript,
   saveConsultation,
@@ -32,7 +30,11 @@ import {
 } from './lib/common.js'
 import { deliverToClaude } from './lib/deliver.js'
 import { connectClaude, listSessions, formatSessions } from './lib/discovery.js'
-import { addPending, launchClaude, readPending, startTimeoutMs, takePending } from './lib/launch.js'
+import { addPending, launchClaude, readPending, claimPending, finishPending } from './lib/launch.js'
+import { bindPending, beginHandover, releaseClaim } from './lib/pending.js'
+import { messages, formatMessages } from './lib/messages.js'
+import { acceptLaunch, callerLaunch } from './lib/launch-state.js'
+import { withStoreLock } from './lib/store.js'
 import { config } from './lib/config.js'
 import { version } from './lib/version.js'
 
@@ -46,10 +48,11 @@ const TOOLS = [
   },
   {
     name: 'connect_claude',
-    description: 'Connect before asking Claude. Reuses a valid pairing, otherwise connects only to the sole unpaired Claude in project_dir. If ambiguous or changed, ask the user to select a label, then pass session. Never choose a replacement silently.',
+    description: 'Use send_to_claude for ordinary requests. Connect here for bridge bootstrap or an explicitly selected existing conversation. Reuses a valid pairing, otherwise connects only to the sole unpaired Claude in project_dir. If ambiguous or changed, ask the user to select a label, then pass session. Never choose a replacement silently.',
     inputSchema: { type: 'object', properties: {
       project_dir: { type: 'string', description: 'Absolute working directory of your current project (not the MCP server directory)' },
-      session: { type: 'string', description: 'Explicit user-selected Claude label; may replace an existing pairing' },
+      session: { type: 'string', description: 'User-selected existing label or the label supplied by bridge bootstrap' },
+      launch_id: { type: 'string', description: 'Optional bootstrap launch ID; host process ancestry is authoritative' },
     }, required: ['project_dir'] },
   },
   {
@@ -149,6 +152,8 @@ function turnMetadata(meta) {
 function callerThread(meta) {
   const t = String(meta?.threadId || turnMetadata(meta)?.thread_id || '').toLowerCase()
   if (!isUuid(t)) throw new Error('Codex did not identify the calling thread (no _meta.threadId on the tool call)')
+  const provenance = callerLaunch('codex')
+  if (provenance?.state === 'superseded' && !provenance.connected) throw new Error('This startup was superseded; use the current agent window.')
   if (!openCodexThreads().has(t)) throw new Error(`calling thread ${t} is not open in the Codex process running this bridge`)
   return t
 }
@@ -165,18 +170,19 @@ async function sendToClaude(args, thread) {
     if (ping.status === 'ok' && ping.session === pair.claude_session) {
       const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: body })
       if (res.status === 'delivered') {
-        return text(`delivered to Claude session "${label}" (msg_id ${res.msg_id}). Claude's answer, if any, arrives later as a queued message.`)
+        return text(`notification sent to Claude session "${label}" (msg_id ${res.msg_id}). Receipt unconfirmed; Claude's answer, if any, arrives later as a queued message.`)
       }
-      return fail(`${res.status}: Claude session "${label}" did not receive msg_id ${res.msg_id}${res.error ? ` (${res.error})` : ''}. Not retried.`)
+      return fail(`${res.status}: handover of msg_id ${res.msg_id} to Claude session "${label}" was not confirmed${res.error ? ` (${res.error})` : ''}. Not retried.`)
     }
     if (ping.status === 'transitioning') return fail(`Claude session "${label}" is switching conversations; try again shortly.`)
     if (ping.status === 'disconnected') {
       // The paired conversation isn't running: reopen it and deliver once it's up.
       const cwd = pair.cwd || projectDir(args)
-      const { launch } = addPending('claude', label, { codex: thread, claude_session: pair.claude_session }, body)
-      if (launch) await launchOrForget(label, () => launchClaude(cwd, label, ['--resume', pair.claude_session]))
-      return text(`Claude conversation ${pair.claude_session} wasn't running, so it ${launch ? 'was reopened' : 'is already reopening'} in a terminal in ${cwd}. ` +
-        'The message is delivered once it starts; approve the channel prompt there. The answer arrives later as a queued message.')
+      const { msg_id } = await addPending('claude', label, { codex: thread, claude_session: pair.claude_session, cwd }, body)
+      const attempt = await launchPreservingRequests(label, () => launchClaude(cwd, label, ['--resume', pair.claude_session], thread))
+      if (['failed', 'exited'].includes(attempt.launch.state)) return text(`Request ${msg_id} is preserved; the agent window closed or startup failed. Run: cc-bridge retry ${msg_id}`)
+      return text(`Claude conversation ${pair.claude_session} wasn't running, so it ${attempt.fresh ? 'was reopened' : 'is already reopening'} in a terminal in ${cwd}. ` +
+        `Request ${msg_id} is waiting for connection; approve the channel prompt there. The answer arrives later as a queued message.`)
     }
     if (ping.status !== 'ok') return fail(`Claude session "${label}" did not answer (${ping.status}${ping.error ? `: ${ping.error}` : ''}); not starting another. Not retried.`)
     // ok but a different conversation now owns the label: this thread has no connection.
@@ -190,24 +196,28 @@ function projectDir(args) {
   return dir
 }
 
-async function launchOrForget(label, launch) {
+async function launchPreservingRequests(label, launch) {
   try {
-    await launch()
+    return await launch()
   } catch (err) {
-    takePending('claude', label)
-    throw new Error(`${err.message}. Start claude-live yourself and pair it with this thread.`)
+    // Keep pending requests after a failed launch.
+    const request = readPending('claude', label)?.messages.find(m => m.state === 'pending')
+    throw new Error(`${err.message}. Request ${request?.msg_id || ''} is preserved. Run: cc-bridge retry ${request?.msg_id || '<message-id>'}`)
   }
 }
 
 // No connection: start a NEW Claude conversation under a fresh label; it pairs with
 // this thread and receives the message as soon as its channel is up.
 async function startNewClaude(thread, cwd, body, oldLabel) {
+  return withStoreLock('new-claude', async () => {
   const label = await freshLabel(thread)
-  const { launch } = addPending('claude', label, { codex: thread, claude_session: null }, body)
-  if (launch) await launchOrForget(label, () => launchClaude(cwd, label))
+  const { msg_id, batch_id } = await addPending('claude', label, { codex: thread, claude_session: null, cwd }, body)
+  const attempt = await launchPreservingRequests(label, () => launchClaude(cwd, label, [], thread, false, batch_id))
+  if (['failed', 'exited'].includes(attempt.launch.state)) return text(`Request ${msg_id} is preserved; startup needs recovery. Run: cc-bridge retry ${msg_id}`)
   return text(`This thread had no running Claude connection${oldLabel ? ` ("${oldLabel}" now belongs to another conversation)` : ''}, ` +
-    `so a new Claude conversation "${label}" ${launch ? 'was started' : 'is already starting'} in a terminal in ${cwd}. ` +
-    'The message is delivered once it starts; approve the prompts there. The answer arrives later as a queued message.')
+    `so a new Claude conversation "${label}" ${attempt.fresh ? 'was started' : 'is already starting'} in a terminal in ${cwd}. ` +
+    `Request ${msg_id} is waiting for connection; approve the prompts there. The answer arrives later as a queued message.`)
+  })
 }
 
 // A label for a new Claude conversation: one already starting for this thread (so a
@@ -218,11 +228,11 @@ async function freshLabel(thread) {
   const candidates = [base, ...Array.from({ length: 50 }, (_, i) => `${base}-${i + 2}`)]
   for (const label of candidates) {
     const pending = readPending('claude', label)
-    if (pending && pending.codex === thread && pending.claude_session === null && Date.now() - pending.started_at < startTimeoutMs()) return label
+    if (pending && pending.codex === thread && pending.claude_session === null && pending.messages.some(m => !m.state || m.state === 'pending') && (await sendToClaudeSocket(label, { op: 'ping' }, 1000)).status === 'disconnected') return label
   }
   for (const label of candidates) {
     const pending = readPending('claude', label)
-    if (loadPairs()[label] || (pending && Date.now() - pending.started_at < startTimeoutMs())) continue
+    if (loadPairs()[label] || pending?.messages.some(m => ['pending', 'claimed'].includes(m.state || 'pending'))) continue
     if ((await sendToClaudeSocket(label, { op: 'ping' }, 1000)).status !== 'disconnected') continue
     return label
   }
@@ -230,20 +240,33 @@ async function freshLabel(thread) {
 }
 
 // Messages Claude left while this Codex was being started for it.
-function takePendingFromClaude(label, pair) {
-  const pending = takePending('codex', label)
-  if (!pending) return ''
-  if (pending.claude_session !== pair.claude_session) {
-    record({ event: 'dropped', label, reason: `pending messages were for Claude conversation ${pending.claude_session}` })
-    return ''
+async function takePendingFromClaude(label, pair) {
+  const messages = []
+  let warning = ''
+  for (;;) {
+    let pending
+    try {
+      pending = await claimPending('codex', label)
+      if (!pending) break
+      const m = pending.message
+      if (pending.claude_session !== pair.claude_session || (pending.codex && pending.codex !== pair.codex)) {
+        await finishPending('codex', label, m.msg_id, 'dropped', 'Claude conversation changed', m.claim_id)
+        continue
+      }
+      await bindPending('codex', label, m.msg_id, pair.codex, m.claim_id)
+      await beginHandover('codex', label, m.msg_id, m.claim_id)
+      record({ event: 'sent', msg_id: m.msg_id, created_at: m.created_at, from: claudeParty(label), to: codexParty(pair.codex), claude_session: pair.claude_session, reply_to: null, kind: 'message', text: m.text })
+      messages.push(formatForCodex({ msgId: m.msg_id, fromLabel: label, replyToId: null, kind: 'message', text: m.text }))
+      await finishPending('codex', label, m.msg_id, 'unconfirmed', 'Included in connection response; receipt confirmed only by a reply', m.claim_id)
+    } catch (err) {
+      if (pending) {
+        try { await releaseClaim('codex', label, pending.message.msg_id, pending.message.claim_id, err.message) } catch {}
+      }
+      warning = `\nFurther handover delayed: ${err.message}. Call connect_claude again with session ${label} to collect remaining requests. Earlier messages remain valid.`
+      break // return already prepared messages even if a later operation fails
+    }
   }
-  const messages = pending.messages.map(m => {
-    const msgId = newId()
-    record({ event: 'sent', msg_id: msgId, from: claudeParty(label), to: codexParty(pair.codex), claude_session: pair.claude_session, reply_to: null, kind: 'message', text: m.text })
-    record({ event: 'queued', msg_id: msgId, detail: 'handed over by connect_claude' })
-    return formatForCodex({ msgId, fromLabel: label, replyToId: null, kind: 'message', text: m.text })
-  })
-  return `\n\nPending message(s) from Claude:\n\n${messages.join('\n\n')}`
+  return (messages.length ? `\n\nPending message(s) from Claude:\n\n${messages.join('\n\n')}` : '') + warning
 }
 
 async function replyToClaude(args, thread) {
@@ -256,29 +279,14 @@ async function replyToClaude(args, thread) {
   if (pair?.codex !== thread) return fail(`Claude session "${label}" is no longer paired with thread ${thread}; not rerouting`)
   validateReply(args.msg_id, codexParty(thread), pair.claude_session, events)
   const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: String(args.text || ''), replyToId: original.msg_id, kind: 'reply' })
-  if (res.status === 'delivered') return text(`reply delivered to Claude session "${label}" (msg_id ${res.msg_id}).`)
-  return fail(`${res.status}: reply msg_id ${res.msg_id} not delivered to Claude session "${label}"${res.error ? ` (${res.error})` : ''}. Not retried.`)
+  if (res.status === 'delivered') return text(`reply notification sent to Claude session "${label}" (msg_id ${res.msg_id}); receipt unconfirmed.`)
+  return fail(`${res.status}: reply msg_id ${res.msg_id} not notification sent to Claude session "${label}"${res.error ? ` (${res.error})` : ''}. Not retried.`)
 }
 
 async function status(meta) {
-  const pairs = Object.entries(loadPairs())
-  let me
-  try {
-    me = callerThread(meta)
-  } catch (err) {
-    me = `unverified (${err.message})`
-  }
-  const lines = [`this thread: ${me}`, 'pairings:']
-  for (const [label, pair] of pairs) {
-    lines.push(`  claude "${label}" (conversation ${pair.claude_session}) ⇄ codex ${pair.codex}: ${await pairState(label, pair)}`)
-  }
-  if (!pairs.length) lines.push('  (none)')
-  lines.push('recent:')
-  const recent = readTranscript().filter(e => e.event === 'sent').slice(-10)
-  for (const e of recent) lines.push(`  ${e.ts} ${e.kind} ${e.from} → ${e.to} msg_id=${e.msg_id}${e.reply_to ? ` in_reply_to=${e.reply_to}` : ''}`)
-  if (!recent.length) lines.push('  (none)')
-  lines.push('sessions:', formatSessions(await listSessions()))
-  return text(lines.join('\n'))
+  const thread = callerThread(meta)
+  const recent = messages().filter(m => m.from === codexParty(thread) || m.to === codexParty(thread)).slice(-10)
+  return text(formatSessions(await listSessions()) + '\n\n' + formatMessages(recent))
 }
 
 function consult(args) {
@@ -335,7 +343,7 @@ const mcp = new Server(
     instructions:
       'cc-bridge connects this Codex thread to a live Claude Code session (Codex identifies the calling thread automatically). ' +
       'When the user asks you to ask Claude, call send_to_claude with your project_dir: it uses this thread\'s Claude connection, reopens it if needed, or starts a new Claude conversation when there is none. ' +
-      'Use connect_claude only to attach to an existing Claude conversation the user names (list_sessions shows them). ' +
+      'Use connect_claude for bridge bootstrap instructions or to attach to an existing Claude conversation the user names (list_sessions shows them). ' +
       'Claude messages arrive as "[cc-bridge message|reply from Claude session ...]" with a msg_id; answer with `reply`. Start exchanges ' +
       `with \`send_to_claude\`. Your ordinary output is NOT forwarded to Claude. ${RULES} ` +
       '`consult_claude` is a separate read-only Claude, independent of the live session.',
@@ -348,13 +356,23 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = req.params.arguments || {}
   const meta = req.params._meta
   try {
+    const provenance = callerLaunch('codex')
+    if (provenance && !provenance.connected) {
+      callerThread(meta) // reject late superseded startups on every tool path
+      if (provenance.codex) await acceptLaunch('codex', provenance.label, callerThread(meta)) // resumed known thread
+    }
     switch (req.params.name) {
       case 'list_sessions':
         return text(JSON.stringify(await listSessions(), null, 2))
       case 'connect_claude': {
-        const result = await connectClaude(callerThread(meta), args.project_dir, args.session)
+        const thread = callerThread(meta)
+        const provenance = callerLaunch('codex')
+        if (!args.session && provenance && !provenance.connected) args.session = provenance.label
+        const pending = args.session && readPending('codex', args.session)
+        if (args.session && (provenance || pending?.messages.some(m => ['pending', 'claimed'].includes(m.state || 'pending')))) await acceptLaunch('codex', args.session, thread, args.launch_id)
+        const result = await connectClaude(thread, args.project_dir, args.session, pending?.claude_session)
         return text(`Connected Claude "${result.label}" (${result.pair.claude_session}) ⇄ Codex ${result.pair.codex}` +
-          takePendingFromClaude(result.label, result.pair))
+          await takePendingFromClaude(result.label, result.pair))
       }
       case 'send_to_claude':
         return await sendToClaude(args, callerThread(meta))
@@ -364,9 +382,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return await status(meta)
       case 'pair_with_claude': {
         const thread = callerThread(meta)
-        const { pair, replaced } = await pairLive(String(args.session), thread)
+        const pending = readPending('codex', String(args.session))
+        if (callerLaunch('codex') || pending?.messages.some(m => ['pending', 'claimed'].includes(m.state || 'pending'))) await acceptLaunch('codex', String(args.session), thread, args.launch_id)
+        const { pair, replaced } = await pairLive(String(args.session), thread, { expectedSession: pending?.claude_session })
         return text(`paired Claude session "${args.session}" (conversation ${pair.claude_session}) ⇄ Codex thread ${thread}` +
-          (replaced.length ? `\nreplaced: ${replaced.map(r => `"${r.claude}" ⇄ ${r.codex}`).join(', ')}` : ''))
+          (replaced.length ? `\nreplaced: ${replaced.map(r => `"${r.claude}" ⇄ ${r.codex}`).join(', ')}` : '') + await takePendingFromClaude(String(args.session), pair))
       }
       case 'consult_claude':
         return await consult(args)

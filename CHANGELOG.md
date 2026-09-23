@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.4.0 — first public release
+## 0.5.0 — first public release
+
+- Requests for an agent that is still starting get an id and timestamp at once, and survive a slow approval, an interrupted handover or a closed window. After a conversation change they are recorded as dropped, never rerouted.
+- One window per startup: the launch is reserved before the terminal opens and tracked by a wrapper inside it, so a slow start no longer opens a second window.
+- `cc-bridge status` shows waiting requests and their age (`--verbose` for full ids). New `cc-bridge retry <id>` and `cc-bridge cancel <id>`.
+- Delivery states say what is known: "queued to Codex", and "notification sent; receipt unconfirmed" for Claude until a real reply.
+- `pair_with_claude` hands over pending messages like `connect_claude`.
+
+## 0.4.1
+
+- An agent started by the bridge no longer inherits the starting agent's session environment. A Codex opened from Claude used to receive `CLAUDE_PROJECT_DIR`, Claude's session ids and its messaging token, which made Codex hooks behave as if they ran under Claude.
+- README: what Claude and Codex ask you to allow, and how to stop Codex asking for every bridge tool call.
+
+## 0.4.0
 
 - Config file `~/.config/cc-bridge/config.json` for every setting (`cc-bridge config`, `config init`, `config set`). Existing `CC_BRIDGE_*` environment variables still work and take precedence.
 - Plan cross-review is opt-in (`plan_review.review_claude_plans`, `plan_review.review_codex_plans`). The Codex `Stop` hook is installed only when Codex plan review is enabled.

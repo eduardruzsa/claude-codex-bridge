@@ -237,7 +237,7 @@ test('a second claude-live gets the next free label; an explicit label is never 
   const saved = fs.existsSync(pairsFile) ? fs.readFileSync(pairsFile, 'utf8') : null
   fs.writeFileSync(pairsFile, JSON.stringify({ 'claude-7': { codex: T, claude_session: 'resumed', cwd } }), { mode: 0o600 })
   const resumed = await channel('claude-7', cwd, null, { explicit: false, session: 'resumed' })
-  assert.match(await status(resumed), /label: claude-7 \(listening\)[\s\S]*pairing: Codex thread 11111111/)
+  assert.match(await status(resumed), /label: claude-7 \(listening\)[\s\S]*claude-7: paired/)
 
   // Lifecycle identity decides, not a stale CLAUDE_CODE_SESSION_ID, even when
   // SessionStart arrives after the channel started.
