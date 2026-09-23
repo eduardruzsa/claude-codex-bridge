@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping. Bug reports, fixes and docs improvements are all welcome.
+Thanks for helping. Bug reports, fixes and docs improvements are all welcome. If you work with a coding agent, it will pick up [AGENTS.md](AGENTS.md), which has the commands, layout and the rules that must hold.
 
 ## Before you start
 
