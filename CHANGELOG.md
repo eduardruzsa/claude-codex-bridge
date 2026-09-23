@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- An agent started by the bridge no longer inherits the starting agent's session environment. A Codex opened from Claude used to receive `CLAUDE_PROJECT_DIR`, Claude's session ids and its messaging token, which made Codex hooks behave as if they ran under Claude.
+- README: what Claude and Codex ask you to allow, and how to stop Codex asking for every bridge tool call.
+
 ## 0.4.0 — first public release
 
 - Config file `~/.config/cc-bridge/config.json` for every setting (`cc-bridge config`, `config init`, `config set`). Existing `CC_BRIDGE_*` environment variables still work and take precedence.
