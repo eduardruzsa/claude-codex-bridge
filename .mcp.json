@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cc-bridge": {
+      "command": "sh",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/plugin-start"]
+    }
+  }
+}

@@ -20,6 +20,9 @@ const OTHER_THREAD = '99999999-2222-3333-4444-555555555555'
 const T3 = '33333333-2222-3333-4444-555555555555'
 const T4 = '44444444-2222-3333-4444-555555555555'
 const T7 = '77777777-2222-3333-4444-555555555555'
+const T9 = '90909090-2222-3333-4444-555555555555'
+const T10 = 'a0a0a0a0-2222-3333-4444-555555555555'
+const T11 = 'b1b1b1b1-2222-3333-4444-555555555555'
 const FOREIGN = 'ffffffff-2222-3333-4444-555555555555'
 const queueLog = path.join(tmp, 'codex-queue.log')
 
@@ -30,6 +33,8 @@ Object.assign(env, {
   CC_BRIDGE_RUNTIME_DIR: path.join(tmp, 'run'),
   CC_BRIDGE_CODEX_BIN: path.join(tmp, 'codex'),
   CC_BRIDGE_CLAUDE_BIN: path.join(tmp, 'claude'),
+  CC_BRIDGE_ACTIVE: '1', // these tests aren't started from a claude-live session
+  CC_BRIDGE_TERMINAL: path.join(tmp, 'terminal'),
 })
 Object.assign(process.env, env) // so lib/common.js in this process sees the same dirs
 fs.mkdirSync(env.CC_BRIDGE_DATA_DIR, { recursive: true, mode: 0o700 })
@@ -50,6 +55,14 @@ process.stdin.on('data', d => (input += d)).on('end', () => {
   console.log(JSON.stringify({ result: 'echo: ' + input + ' | cwd: ' + process.cwd() + ' | args: ' + args.join(' '), session_id, is_error: false }))
 })
 `, { mode: 0o755 })
+
+fs.writeFileSync(env.CC_BRIDGE_TERMINAL, `#!/usr/bin/env node
+require('fs').appendFileSync(${JSON.stringify(path.join(tmp, 'terminal.log'))}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }) + '\\n')
+`, { mode: 0o755 })
+const launched = () => {
+  const f = path.join(tmp, 'terminal.log')
+  return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : []
+}
 
 const { labelMutexName, pairLive } = await import('../lib/common.js')
 
@@ -206,7 +219,7 @@ test('a peer that closes without answering settles the request', async () => {
   await new Promise(r => server.close(r))
 })
 
-test('routing errors: unknown session, wrong thread, unpaired', async () => {
+test('routing errors: unknown session, wrong thread', async () => {
   const unknown = await codex.call('send_to_claude', { text: 'x', session: 'nope', as_thread: THREAD })
   assert.ok(!unknown.ok)
   assert.match(unknown.text, /unknown session/)
@@ -214,12 +227,6 @@ test('routing errors: unknown session, wrong thread, unpaired', async () => {
   const wrong = await codex.call('send_to_claude', { text: 'x', session: 't1', as_thread: OTHER_THREAD })
   assert.ok(!wrong.ok)
   assert.match(wrong.text, /not rerouting/)
-
-  const orphan = await startClaude('orphan', 'claude-sess-orphan')
-  const r = await orphan.call('send_to_codex', { text: 'x' })
-  assert.ok(!r.ok)
-  assert.match(r.text, /not paired/)
-  await orphan.client.close()
 })
 
 test('Codex identity comes from the host _meta, is checked against the process, and cannot be claimed', async () => {
@@ -289,14 +296,19 @@ test('a new Claude conversation reusing a label does not inherit the pairing', a
 
   const second = await startClaude('t4', 'conv-B')
   await waitFor(() => fs.existsSync(sockFile('t4')))
-  const toB = await codex.call('send_to_claude', { text: 'meant for A', as_thread: T4 })
-  assert.ok(!toB.ok)
-  assert.match(toB.text, /^session_changed/)
+  // Codex's connection (conversation A) is gone: it starts a new Claude conversation
+  // instead of delivering A's message to B.
+  const launches = launched().length
+  const toB = await codex.call('send_to_claude', { text: 'meant for A', as_thread: T4, project_dir: tmp })
+  assert.ok(toB.ok, toB.text)
+  assert.match(toB.text, /"t4" now belongs to another conversation.*new Claude conversation "codex-44444444"/)
+  assert.match((await waitFor(() => launched()[launches])).argv.join(' '), /^env CC_BRIDGE_LABEL=codex-44444444 \S+\/bin\/claude-live$/)
   assert.equal(second.notifications.filter(channel).length, 0)
 
+  // B has no connection of its own either: it starts a new Codex conversation.
   const fromB = await second.call('send_to_codex', { text: 'hi' })
-  assert.ok(!fromB.ok)
-  assert.match(fromB.text, /belongs to Claude conversation conv-A/)
+  assert.ok(fromB.ok, fromB.text)
+  assert.match(fromB.text, /started a new Codex session.*replacing the pairing with thread 4444/)
 
   const s = await codex.call('bridge_status', { as_thread: T4 })
   assert.match(s.text, /claude "t4" \(conversation conv-A\) ⇄ codex 4444.*session changed \(now conv-B; re-pair\)/)
@@ -386,16 +398,109 @@ test('failed codex queue is reported, not retried, and does not consume the repl
   await failing.client.close()
 })
 
-test('disconnected Claude session is reported explicitly', async () => {
+test('Codex reopens its paired Claude conversation when it is not running', async () => {
   const gone = await startClaude('t3', 'claude-sess-t3')
   await waitFor(() => fs.existsSync(sockFile('t3')))
   await pairLive('t3', T3)
   await gone.client.close()
   await waitFor(() => !fs.existsSync(sockFile('t3')))
-  const r = await codex.call('send_to_claude', { text: 'hello?', as_thread: T3 })
-  assert.ok(!r.ok)
-  assert.match(r.text, /^disconnected/)
   assert.match((await codex.call('bridge_status', { as_thread: T3 })).text, /claude "t3" .*: disconnected/)
+
+  const launches = launched().length
+  const r = await codex.call('send_to_claude', { text: 'hello again', as_thread: T3 })
+  assert.ok(r.ok, r.text)
+  assert.match(r.text, /wasn't running, so it was reopened/)
+  const again = await codex.call('send_to_claude', { text: 'second', as_thread: T3 })
+  assert.match(again.text, /already reopening/)
+  await new Promise(r => setTimeout(r, 300))
+  assert.equal(launched().length, launches + 1, 'one terminal, not two')
+  assert.match((await waitFor(() => launched()[launches])).argv.join(' '), /^env CC_BRIDGE_LABEL=t3 \S+\/bin\/claude-live --resume claude-sess-t3$/)
+
+  // The resumed conversation's channel comes up and receives both messages.
+  const back = await startClaude('t3', 'claude-sess-t3')
+  const got = await waitFor(() => back.notifications.filter(channel).length === 2 && back.notifications.filter(channel))
+  assert.deepEqual(got.map(n => n.params.content), ['hello again', 'second'])
+  const before = queued().length
+  assert.ok((await back.call('reply', { msg_id: got[0].params.meta.msg_id, text: 'welcome back' })).ok)
+  assert.deepEqual((await waitFor(() => queued()[before])).slice(0, 3), ['queue', '--thread', T3])
+  await back.client.close()
+})
+
+test('Codex with no connection starts a new Claude conversation that pairs itself', async () => {
+  const lone = await startCodex([T9])
+  const launches = launched().length
+  const r = await lone.call('send_to_claude', { text: 'fresh start?', as_thread: T9, project_dir: tmp })
+  assert.ok(r.ok, r.text)
+  const label = 'codex-' + T9.slice(0, 8)
+  const l = (await waitFor(() => launched()[launches]))
+  assert.equal(l.cwd, tmp)
+  assert.equal(l.argv[1], `CC_BRIDGE_LABEL=${label}`)
+
+  const fresh = await startClaude(label, 'conv-fresh')
+  const n = await waitFor(() => fresh.notifications.filter(channel)[0])
+  assert.equal(n.params.content, 'fresh start?')
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(env.CC_BRIDGE_DATA_DIR, 'pairs.json'), 'utf8'))[label].codex, T9)
+  const before = queued().length
+  assert.ok((await fresh.call('reply', { msg_id: n.params.meta.msg_id, text: 'yes' })).ok)
+  assert.deepEqual((await waitFor(() => queued()[before])).slice(0, 3), ['queue', '--thread', T9])
+  await fresh.client.close()
+  await lone.client.close()
+})
+
+test('Claude with no connection starts a new Codex conversation; it connects and gets the message', async () => {
+  const solo = await startClaude('t10', 'conv-t10')
+  await waitFor(() => fs.existsSync(sockFile('t10')))
+  const launches = launched().length
+  const r1 = await solo.call('send_to_codex', { text: 'first' })
+  const r2 = await solo.call('send_to_codex', { text: 'second' })
+  assert.ok(r1.ok && r2.ok, r1.text + r2.text)
+  assert.match(r2.text, /already starting/)
+  await new Promise(r => setTimeout(r, 300))
+  assert.equal(launched().length, launches + 1, 'one terminal, not two')
+  const l = (await waitFor(() => launched()[launches]))
+  assert.equal(path.basename(l.argv[0]), 'codex')
+  assert.match(l.argv[1], /connect_claude tool with project_dir ".*" and session "t10"/)
+
+  // The new Codex thread connects as told and receives both messages.
+  const fresh = await startCodex([T10])
+  const c = await fresh.call('connect_claude', { project_dir: tmp, session: 't10', as_thread: T10 })
+  assert.ok(c.ok, c.text)
+  assert.match(c.text, /Pending message\(s\) from Claude:[\s\S]*first[\s\S]*second/)
+  const count = solo.notifications.filter(channel).length
+  const rep = await fresh.call('reply', { msg_id: msgIdFrom(c.text), text: 'got it', as_thread: T10 })
+  assert.ok(rep.ok, rep.text)
+  assert.equal((await waitFor(() => solo.notifications.filter(channel)[count])).params.content, 'got it')
+  await fresh.client.close()
+  await solo.client.close()
+})
+
+test('Claude reopens its paired Codex thread when it is not running', async () => {
+  const c = await startClaude('t11', 'conv-t11')
+  await waitFor(() => fs.existsSync(sockFile('t11')))
+  await pairLive('t11', T11) // no process holds T11's rollout open
+  const before = queued().length
+  const launches = launched().length
+  const r = await c.call('send_to_codex', { text: 'are you there?' })
+  assert.ok(r.ok, r.text)
+  assert.match(r.text, /wasn't running, so it was reopened/)
+  assert.deepEqual((await waitFor(() => queued()[before])).slice(0, 3), ['queue', '--thread', T11])
+  assert.deepEqual((await waitFor(() => launched()[launches])).argv.slice(1, 3), ['resume', T11])
+  await c.client.close()
+})
+
+test('the channel is dormant unless Claude was started with it', async () => {
+  const d = await connect('node', [path.join(root, 'claude-channel.js')], { CC_BRIDGE_LABEL: 'dormant', CLAUDE_CODE_SESSION_ID: 'x', CC_BRIDGE_ACTIVE: '' })
+  assert.deepEqual((await d.client.listTools()).tools, [])
+  await new Promise(r => setTimeout(r, 300))
+  assert.ok(!fs.existsSync(sockFile('dormant')))
+  await d.client.close()
+
+  const { launchedWithChannel } = await import('../lib/claude-process.js')
+  assert.ok(launchedWithChannel(['claude', '--dangerously-load-development-channels', 'plugin:cc-bridge@cc-bridge', '--continue']))
+  assert.ok(launchedWithChannel(['claude', '--channels=plugin:other@x,plugin:cc-bridge@local']))
+  assert.ok(!launchedWithChannel(['claude', '--continue']))
+  assert.ok(!launchedWithChannel(['claude', '--dangerously-load-development-channels', 'plugin:fakechat@official', 'plugin:cc-bridge@x']) === false)
+  assert.ok(!launchedWithChannel(['claude', '-p', 'plugin:cc-bridge@cc-bridge']))
 })
 
 test('pairing requires a live Claude session', async () => {

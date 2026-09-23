@@ -7,7 +7,6 @@ import { after, test } from 'node:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { install, minimumNode, supportedNode, root } from '../lib/admin.js'
-import { launchArgs } from '../lib/launcher.js'
 import { transition } from '../lib/lifecycle.js'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
@@ -42,7 +41,7 @@ async function channel(label, cwd, lifecycle) {
   const notifications = []
   client.fallbackNotificationHandler = async n => notifications.push(n)
   clients.add(client)
-  const env = { ...process.env, CC_BRIDGE_LABEL: label, CLAUDE_CODE_SESSION_ID: `${label}-session` }
+  const env = { ...process.env, CC_BRIDGE_LABEL: label, CLAUDE_CODE_SESSION_ID: `${label}-session`, CC_BRIDGE_ACTIVE: '1' }
   delete env.CC_BRIDGE_LIFECYCLE_DIR
   if (lifecycle) env.CC_BRIDGE_LIFECYCLE_DIR = lifecycle
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'claude-channel.js')], cwd, env }))
@@ -83,18 +82,34 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   assert.ok(!supportedNode('22.23.1'))
 })
 
-test('launcher preserves CLI settings/hooks, safely quotes paths, and forwards resume', () => {
-  const user = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'user-hook' }] }], Stop: [{ hooks: [] }] }, model: 'user-model' }
-  const args = launchArgs(['--settings', JSON.stringify(user), '--resume', 'session'], "/tmp/repo's name", '/tmp/launch', 'review')
-  const settings = JSON.parse(args[args.indexOf('--settings') + 1])
-  assert.equal(settings.model, user.model)
-  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, 'user-hook')
-  assert.equal(settings.hooks.SessionStart.length, 2)
-  assert.deepEqual(settings.hooks.Stop, user.hooks.Stop)
-  assert.match(settings.hooks.SessionStart[1].hooks[0].command, /repo'\\''s name/)
-  assert.deepEqual(args.slice(-2), ['--resume', 'session'])
-  const mcp = JSON.parse(args[args.indexOf('--mcp-config') + 1]).mcpServers['cc-bridge']
-  assert.equal(mcp.env.CC_BRIDGE_LIFECYCLE_DIR, '/tmp/launch')
+test('claude-live enables the plugin channel and forwards arguments', () => {
+  const echo = path.join(tmp, 'echo-args')
+  fs.writeFileSync(echo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 })
+  const out = execFileSync(path.join(root, 'bin', 'claude-live'), ['--resume', "it's"], { env: { ...process.env, CC_BRIDGE_CLAUDE_BIN: echo }, encoding: 'utf8' })
+  assert.deepEqual(out.trim().split('\n'), ['--dangerously-load-development-channels', 'plugin:cc-bridge@cc-bridge', '--resume', "it's"])
+})
+
+test('plugin manifests wire the channel server and lifecycle hooks', () => {
+  const read = f => JSON.parse(fs.readFileSync(path.join(root, f), 'utf8'))
+  assert.equal(read('.claude-plugin/plugin.json').name, 'cc-bridge')
+  const market = read('.claude-plugin/marketplace.json')
+  assert.equal(market.name, 'cc-bridge')
+  assert.deepEqual(market.plugins.map(p => [p.name, p.source]), [['cc-bridge', './']])
+  assert.deepEqual(read('.mcp.json').mcpServers['cc-bridge'].args, ['${CLAUDE_PLUGIN_ROOT}/bin/plugin-start'])
+  for (const event of ['SessionStart', 'SessionEnd']) {
+    assert.match(read('hooks/hooks.json').hooks[event][0].hooks[0].command, /lifecycle-hook\.js" --plugin$/)
+  }
+})
+
+test('plugin-mode hook is a no-op outside channel sessions', () => {
+  const before = fs.existsSync(process.env.CC_BRIDGE_RUNTIME_DIR) ? fs.readdirSync(process.env.CC_BRIDGE_RUNTIME_DIR) : []
+  const run = spawnSync(process.execPath, [path.join(root, 'bin/lifecycle-hook.js'), '--plugin'], {
+    input: JSON.stringify({ session_id: 's', hook_event_name: 'SessionStart', source: 'startup', cwd: tmp }), encoding: 'utf8',
+    env: { ...process.env, CC_BRIDGE_ACTIVE: '' },
+  })
+  assert.equal(run.status, 0, run.stderr)
+  const after = fs.existsSync(process.env.CC_BRIDGE_RUNTIME_DIR) ? fs.readdirSync(process.env.CC_BRIDGE_RUNTIME_DIR) : []
+  assert.deepEqual(after.filter(f => f.startsWith('proc-')), before.filter(f => f.startsWith('proc-')))
 })
 
 test('project matching canonicalizes nested/symlink paths and keeps worktrees separate', () => {

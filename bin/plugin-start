@@ -1,0 +1,11 @@
+#!/bin/sh
+# Entry point for the plugin's MCP server. The installed plugin is a copy without
+# node_modules, so install dependencies on first run (serialized; npm output goes
+# to stderr because stdout carries MCP).
+root="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
+if [ ! -d "$root/node_modules/@modelcontextprotocol/sdk" ]; then
+  flock "$root/.install.lock" sh -c '
+    cd "$1" && { [ -d node_modules/@modelcontextprotocol/sdk ] || npm ci --omit=dev --no-audit --no-fund; }
+  ' sh "$root" 1>&2 || exit 1
+fi
+exec node "$root/claude-channel.js"

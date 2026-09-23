@@ -4,10 +4,20 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { updateState } from '../lib/lifecycle.js'
+import { channelActive, findClaudeProcess, lifecycleDirFor } from '../lib/claude-process.js'
 
 const order = process.hrtime.bigint().toString()
-const [dir, locked, originalOrder] = process.argv.slice(2)
+let [dir, locked, originalOrder] = process.argv.slice(2)
 const input = fs.readFileSync(0, 'utf8')
+if (dir === '--plugin') {
+  // Plugin hooks run in every Claude session; only channel sessions keep state.
+  const proc = findClaudeProcess()
+  if (!proc || !channelActive(proc)) process.exit(0)
+  dir = lifecycleDirFor(proc)
+  const event = JSON.parse(input).hook_event_name
+  if (event === 'SessionStart') fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  else if (!fs.existsSync(dir)) process.exit(0)
+}
 try {
   if (!path.isAbsolute(dir) || !fs.statSync(dir).isDirectory()) throw new Error('missing launcher state')
   if (locked === '--locked') {

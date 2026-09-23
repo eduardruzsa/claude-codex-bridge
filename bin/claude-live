@@ -1,28 +1,5 @@
-#!/usr/bin/env node
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
-import { runtimeDir, validLabel } from '../lib/common.js'
-import { launchArgs } from '../lib/launcher.js'
-
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const label = process.env.CC_BRIDGE_LABEL || 'claude'
-if (!validLabel(label)) { console.error('Invalid CC_BRIDGE_LABEL: use 1–40 letters, numbers, underscores or hyphens.'); process.exit(1) }
-fs.mkdirSync(runtimeDir(), { recursive: true, mode: 0o700 })
-const dir = fs.mkdtempSync(path.join(runtimeDir(), 'launch-'))
-fs.chmodSync(dir, 0o700)
-try {
-  const args = launchArgs(process.argv.slice(2), root, dir, label)
-  const child = spawn(process.env.CC_BRIDGE_CLAUDE_BIN || 'claude', args, { stdio: 'inherit' })
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal))
-  child.on('error', e => { console.error(e.message); process.exitCode = 1 })
-  child.on('close', (code, signal) => {
-    fs.rmSync(dir, { recursive: true, force: true })
-    process.exitCode = code ?? (signal ? 1 : 0)
-  })
-} catch (err) {
-  fs.rmSync(dir, { recursive: true, force: true })
-  console.error(err.message)
-  process.exitCode = 1
-}
+#!/bin/sh
+# Claude Code with the cc-bridge channel enabled (needs the cc-bridge plugin; see
+# cc-bridge install). Arguments pass through, e.g. --continue or --resume <id>.
+# CC_BRIDGE_LABEL names the session (default "claude").
+exec "${CC_BRIDGE_CLAUDE_BIN:-claude}" --dangerously-load-development-channels plugin:cc-bridge@cc-bridge "$@"

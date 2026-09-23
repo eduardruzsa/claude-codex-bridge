@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cc-bridge",
+  "description": "Local marketplace for the Claude Code ⇄ Codex bridge.",
+  "owner": { "name": "Eduard Ruzsa" },
+  "plugins": [
+    {
+      "name": "cc-bridge",
+      "description": "Two-way Claude Code ⇄ Codex bridge (Claude Channel).",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}
