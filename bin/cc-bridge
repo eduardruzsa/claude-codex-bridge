@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // cc-bridge: manage Claude ⇄ Codex pairings and inspect the transcript.
 import {
-  claudeSessionAlive,
   dataDir,
   loadPairs,
-  pairSessions,
+  pairLive,
+  pairState,
   readTranscript,
   unpair,
 } from '../lib/common.js'
@@ -29,9 +29,14 @@ switch (cmd) {
       console.error(usage)
       process.exit(2)
     }
-    const replaced = pairSessions(label, thread).filter(r => r.claude !== label || r.codex !== thread)
-    console.log(`paired claude "${label}" ⇄ codex ${thread}`)
-    for (const r of replaced) console.log(`replaced: claude "${r.claude}" ⇄ codex ${r.codex}`)
+    try {
+      const { pair, replaced } = await pairLive(label, thread)
+      console.log(`paired claude "${label}" (conversation ${pair.claude_session}) ⇄ codex ${thread}`)
+      for (const r of replaced) console.log(`replaced: claude "${r.claude}" (conversation ${r.claude_session}) ⇄ codex ${r.codex}`)
+    } catch (err) {
+      console.error(`cc-bridge: ${err.message}`)
+      process.exit(1)
+    }
     break
   }
   case 'unpair': {
@@ -47,9 +52,8 @@ switch (cmd) {
     const pairs = Object.entries(loadPairs())
     console.log(`data: ${dataDir()}`)
     if (!pairs.length) console.log('no pairings')
-    for (const [label, thread] of pairs) {
-      const alive = await claudeSessionAlive(label)
-      console.log(`claude "${label}" ⇄ codex ${thread}  [claude ${alive ? 'connected' : 'disconnected'}]`)
+    for (const [label, pair] of pairs) {
+      console.log(`claude "${label}" (conversation ${pair.claude_session}) ⇄ codex ${pair.codex}  [${await pairState(label, pair)}]`)
     }
     break
   }

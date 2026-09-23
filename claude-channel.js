@@ -17,7 +17,6 @@ import {
   paths,
   readTranscript,
   record,
-  sendToClaudeSocket,
   validLabel,
   validateReply,
   wasDelivered,
@@ -30,6 +29,8 @@ if (!validLabel(label)) {
   process.exit(1)
 }
 const me = claudeParty(label)
+// The real Claude conversation id; pairings bind to it, not just to the label.
+const mySession = process.env.CLAUDE_CODE_SESSION_ID || null
 let listening = false
 let listenError = null
 
@@ -78,10 +79,19 @@ const TOOLS = [
 const text = t => ({ content: [{ type: 'text', text: t }] })
 const fail = t => ({ content: [{ type: 'text', text: t }], isError: true })
 
+// The pairing for this label, only if it belongs to this exact conversation.
+function myPair() {
+  const pair = loadPairs()[label]
+  if (!pair) throw new Error(`Claude session "${label}" is not paired with a Codex thread. Pair it with: cc-bridge pair --claude ${label} --codex <thread-uuid>`)
+  if (pair.claude_session !== mySession) {
+    throw new Error(`the "${label}" pairing belongs to Claude conversation ${pair.claude_session}, not this one (${mySession}); re-pair to use it here`)
+  }
+  return pair
+}
+
 async function sendToPairedCodex(body, replyToId, kind) {
   if (!listening) return fail(`bridge is not listening: ${listenError}`)
-  const thread = loadPairs()[label]
-  if (!thread) return fail(`Claude session "${label}" is not paired with a Codex thread. Pair it with: cc-bridge pair --claude ${label} --codex <thread-uuid>`)
+  const thread = myPair().codex
   const res = await deliverToCodex({ fromLabel: label, thread, text: body, replyToId, kind })
   if (res.status !== 'queued') return fail(`not delivered to Codex thread ${thread}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
   return text(`queued for Codex thread ${thread} (msg_id ${res.msg_id}). Its answer, if any, arrives later as a channel event.`)
@@ -98,9 +108,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'reply': {
         const original = validateReply(String(args.msg_id), me)
         if (parseParty(original.from).side !== 'codex') return fail(`msg_id ${args.msg_id} did not come from Codex`)
-        const paired = loadPairs()[label]
+        const paired = myPair().codex
         const origThread = parseParty(original.from).id
-        if (paired !== origThread) return fail(`msg_id ${args.msg_id} came from Codex thread ${origThread}, but this session is now paired with ${paired || 'nothing'}; not rerouting`)
+        if (paired !== origThread) return fail(`msg_id ${args.msg_id} came from Codex thread ${origThread}, but this session is now paired with ${paired}; not rerouting`)
         return await sendToPairedCodex(String(args.text || ''), original.msg_id, 'reply')
       }
       case 'bridge_status': {
@@ -110,7 +120,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           .map(e => `${e.ts} ${e.kind} ${e.from} → ${e.to} msg_id=${e.msg_id}${e.reply_to ? ` in_reply_to=${e.reply_to}` : ''}`)
         return text([
           `label: ${label} (${listening ? 'listening' : `NOT listening: ${listenError}`})`,
-          `paired Codex thread: ${loadPairs()[label] || 'none'}`,
+          `this conversation: ${mySession}`,
+          `pairing: ${(() => {
+            const p = loadPairs()[label]
+            if (!p) return 'none'
+            return p.claude_session === mySession ? `Codex thread ${p.codex}` : `belongs to another conversation (${p.claude_session}); re-pair`
+          })()}`,
           'recent:',
           ...(recent.length ? recent : ['  (none)']),
         ].join('\n'))
@@ -127,9 +142,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 async function handleRequest(req) {
   if (req.token !== authToken()) return { status: 'error', error: 'unauthorized' }
-  if (req.op === 'ping') return { status: 'ok', label }
+  if (req.op === 'ping') return { status: 'ok', label, session: mySession }
   if (req.op !== 'deliver') return { status: 'error', error: `unknown op ${req.op}` }
   if (req.to !== me) return { status: 'error', error: `this is ${me}, not ${req.to}` }
+  if (req.claude_session !== mySession) {
+    return { status: 'session_changed', error: `label "${label}" is now Claude conversation ${mySession}, not the paired ${req.claude_session}; re-pair` }
+  }
   if (parseParty(req.from).side !== 'codex') return { status: 'error', error: 'sender must be a Codex thread' }
   if (wasDelivered(req.msg_id)) {
     record({ event: 'duplicate', msg_id: req.msg_id })
@@ -172,28 +190,64 @@ function serve(conn) {
   conn.on('error', () => {})
 }
 
-async function listen() {
-  const sockPath = paths.socket(label)
-  if (fs.existsSync(sockPath)) {
-    if (await sendToClaudeSocket(label, { op: 'ping' }, 1000).then(r => r.status === 'ok')) {
-      throw new Error(`another live Claude session already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
-    }
-    fs.unlinkSync(sockPath) // stale socket from a session that died
+// Exclusive ownership: a lock file holding our pid. A socket is only replaced when
+// the lock's owner is provably gone, never because a live owner was slow to answer.
+function lockOwnerAlive(pid) {
+  try {
+    process.kill(pid, 0)
+  } catch (err) {
+    if (err.code === 'ESRCH') return false
   }
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('claude-channel')
+  } catch {
+    return true // can't inspect it; assume alive rather than steal
+  }
+}
+
+function acquireLock(lockPath) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { mode: 0o600, flag: 'wx' })
+      return
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+    }
+    const owner = Number(fs.readFileSync(lockPath, 'utf8'))
+    if (owner && lockOwnerAlive(owner)) {
+      throw new Error(`another live Claude session (pid ${owner}) already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
+    }
+    fs.unlinkSync(lockPath) // owner is gone; one retry, and 'wx' lets only one racer win
+  }
+  throw new Error(`could not take the lock for label "${label}"`)
+}
+
+async function listen() {
+  if (!mySession) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
+  const sockPath = paths.socket(label)
+  const lockPath = `${sockPath}.lock`
+  acquireLock(lockPath)
+  const release = () => {
+    try {
+      if (Number(fs.readFileSync(lockPath, 'utf8')) !== process.pid) return
+      fs.unlinkSync(sockPath)
+    } catch {}
+    try {
+      fs.unlinkSync(lockPath)
+    } catch {}
+  }
+  process.on('exit', release)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0))
+  process.stdin.on('close', () => process.exit(0))
+  try {
+    fs.unlinkSync(sockPath) // we hold the lock, so any socket here is stale
+  } catch {}
   const server = net.createServer(serve)
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(sockPath, resolve)
   })
   fs.chmodSync(sockPath, 0o600)
-  const cleanup = () => {
-    try {
-      fs.unlinkSync(sockPath)
-    } catch {}
-  }
-  process.on('exit', cleanup)
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0))
-  process.stdin.on('close', () => process.exit(0))
 }
 
 await mcp.connect(new StdioServerTransport())

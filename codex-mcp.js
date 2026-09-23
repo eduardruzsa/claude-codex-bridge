@@ -4,17 +4,20 @@
 // messages (which arrive in Codex via `codex queue`), and runs separate
 // read-only `claude -p` consultations.
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   RULES,
-  claudeSessionAlive,
   codexParty,
+  consultArgs,
+  findMessage,
   labelForThread,
   loadConsultations,
   loadPairs,
-  pairSessions,
+  pairLive,
+  pairState,
   parseParty,
   readTranscript,
   saveConsultation,
@@ -23,13 +26,12 @@ import {
 } from './lib/common.js'
 import { deliverToClaude } from './lib/deliver.js'
 
-const CONSULT_TOOLS = 'Read,Grep,Glob'
 const CONSULT_TIMEOUT_MS = 10 * 60 * 1000
 const claudeBin = () => process.env.CC_BRIDGE_CLAUDE_BIN || 'claude'
 
 const THREAD_ARG = {
   type: 'string',
-  description: 'Your Codex thread id. Codex does not pass it to MCP servers, so run `echo $CODEX_THREAD_ID` once and pass it on every cc-bridge call.',
+  description: 'Your Codex thread id: run `echo $CODEX_THREAD_ID` once and pass it on every cc-bridge call. It is verified against the threads of the Codex process that launched this server.',
 }
 
 const TOOLS = [
@@ -80,9 +82,9 @@ const TOOLS = [
       type: 'object',
       properties: {
         prompt: { type: 'string' },
-        session_id: { type: 'string', description: 'session_id from an earlier consult_claude call, to follow up' },
+        session_id: { type: 'string', description: 'session_id from an earlier consult_claude call (see list_consultations), to follow up; it keeps its original directory' },
         label: { type: 'string', description: 'Short name for this consultation, shown by list_consultations' },
-        cwd: { type: 'string', description: 'Directory Claude works in; defaults to this server\'s working directory' },
+        cwd: { type: 'string', description: 'Directory Claude may read, for a new consultation; defaults to this server\'s working directory' },
       },
       required: ['prompt'],
     },
@@ -97,19 +99,52 @@ const TOOLS = [
 const text = t => ({ content: [{ type: 'text', text: t }] })
 const fail = t => ({ content: [{ type: 'text', text: t }], isError: true })
 
-function myThread(args) {
-  return args.codex_thread || process.env.CODEX_THREAD_ID || null
+// Codex thread identity, verified rather than trusted: the Codex process that
+// launched this server keeps each of its threads' rollout-<ts>-<uuid>.jsonl open.
+// (Codex doesn't pass CODEX_THREAD_ID to MCP servers, so the agent supplies it.)
+function openCodexThreads() {
+  const threads = new Set()
+  const fdDir = `/proc/${process.ppid}/fd`
+  let fds = []
+  try {
+    fds = fs.readdirSync(fdDir)
+  } catch {
+    return threads
+  }
+  for (const fd of fds) {
+    try {
+      const m = fs.readlinkSync(`${fdDir}/${fd}`).match(/\/rollout-[^/]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
+      if (m) threads.add(m[1].toLowerCase())
+    } catch {}
+  }
+  return threads
+}
+
+function verifiedThread(args) {
+  const env = process.env.CODEX_THREAD_ID
+  const claimed = args.codex_thread?.toLowerCase()
+  if (env && claimed && env.toLowerCase() !== claimed) throw new Error(`codex_thread ${claimed} does not match CODEX_THREAD_ID ${env}`)
+  const threads = openCodexThreads()
+  const wanted = claimed || env?.toLowerCase()
+  if (wanted) {
+    if (!threads.has(wanted)) throw new Error(`codex_thread ${wanted} is not a thread of the Codex process running this bridge`)
+    return wanted
+  }
+  if (threads.size === 1) return [...threads][0]
+  throw new Error(threads.size
+    ? 'this Codex process has several threads; pass codex_thread (run: echo $CODEX_THREAD_ID)'
+    : 'cannot verify which Codex thread this is (no open Codex thread found); pass codex_thread from a Codex session')
 }
 
 async function sendToClaude(args) {
-  const thread = myThread(args)
-  const label = args.session || (thread && labelForThread(thread))
-  if (!label) return fail('unknown session: no Claude session label given and this thread is not paired. Use pair_with_claude or pass session.')
+  const thread = verifiedThread(args)
+  const label = args.session || labelForThread(thread)
+  if (!label) return fail('unknown session: this thread is not paired with a Claude session. Use pair_with_claude.')
   if (!validLabel(label)) return fail(`unknown session: invalid label "${label}"`)
-  const paired = loadPairs()[label]
-  if (!paired) return fail(`unknown session: Claude session "${label}" is not paired with any Codex thread`)
-  if (thread && paired !== thread) return fail(`Claude session "${label}" is paired with Codex thread ${paired}, not ${thread}; not rerouting`)
-  const res = await deliverToClaude({ fromThread: paired, label, text: String(args.text || '') })
+  const pair = loadPairs()[label]
+  if (!pair) return fail(`unknown session: Claude session "${label}" is not paired with any Codex thread`)
+  if (pair.codex !== thread) return fail(`Claude session "${label}" is paired with Codex thread ${pair.codex}, not ${thread}; not rerouting`)
+  const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: String(args.text || '') })
   if (res.status === 'delivered') {
     return text(`delivered to Claude session "${label}" (msg_id ${res.msg_id}). Claude's answer, if any, arrives later as a queued message.`)
   }
@@ -117,26 +152,31 @@ async function sendToClaude(args) {
 }
 
 async function replyToClaude(args) {
+  const thread = verifiedThread(args)
   const events = readTranscript()
-  const original = events.find(e => e.event === 'sent' && e.msg_id === args.msg_id)
+  const original = findMessage(args.msg_id, events)
   if (!original) return fail(`unknown msg_id ${args.msg_id}`)
-  const { side, id: thread } = parseParty(original.to)
-  if (side !== 'codex') return fail(`msg_id ${args.msg_id} was not addressed to Codex`)
-  const mine = myThread(args)
-  if (mine && mine !== thread) return fail(`msg_id ${args.msg_id} was addressed to Codex thread ${thread}, not ${mine}`)
   validateReply(args.msg_id, codexParty(thread), events)
-  const label = parseParty(original.from).id
-  if (loadPairs()[label] !== thread) return fail(`Claude session "${label}" is no longer paired with thread ${thread}; not rerouting`)
-  const res = await deliverToClaude({ fromThread: thread, label, text: String(args.text || ''), replyToId: original.msg_id, kind: 'reply' })
+  const { side, id: label } = parseParty(original.from)
+  if (side !== 'claude') return fail(`msg_id ${args.msg_id} did not come from Claude`)
+  const pair = loadPairs()[label]
+  if (pair?.codex !== thread) return fail(`Claude session "${label}" is no longer paired with thread ${thread}; not rerouting`)
+  const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: String(args.text || ''), replyToId: original.msg_id, kind: 'reply' })
   if (res.status === 'delivered') return text(`reply delivered to Claude session "${label}" (msg_id ${res.msg_id}).`)
   return fail(`${res.status}: reply msg_id ${res.msg_id} not delivered to Claude session "${label}"${res.error ? ` (${res.error})` : ''}. Not retried.`)
 }
 
 async function status(args) {
   const pairs = Object.entries(loadPairs())
-  const lines = [`this thread: ${myThread(args) || 'unknown (pass codex_thread)'}`, 'pairings:']
-  for (const [label, thread] of pairs) {
-    lines.push(`  claude "${label}" ⇄ codex ${thread}: ${(await claudeSessionAlive(label)) ? 'connected' : 'disconnected'}`)
+  let me
+  try {
+    me = verifiedThread(args)
+  } catch (err) {
+    me = `unverified (${err.message})`
+  }
+  const lines = [`this thread: ${me}`, 'pairings:']
+  for (const [label, pair] of pairs) {
+    lines.push(`  claude "${label}" (conversation ${pair.claude_session}) ⇄ codex ${pair.codex}: ${await pairState(label, pair)}`)
   }
   if (!pairs.length) lines.push('  (none)')
   lines.push('recent:')
@@ -147,15 +187,15 @@ async function status(args) {
 }
 
 function consult(args) {
-  const cliArgs = [
-    '-p',
-    '--output-format', 'json',
-    '--tools', CONSULT_TOOLS,
-    '--allowedTools', CONSULT_TOOLS,
-    '--strict-mcp-config',
-  ]
-  if (args.session_id) cliArgs.push('--resume', args.session_id)
-  const cwd = args.cwd || process.cwd()
+  // Follow-ups may only resume consultations this bridge created, in their original directory.
+  let prev
+  if (args.session_id) {
+    prev = loadConsultations().find(c => c.session_id === args.session_id)
+    if (!prev) return fail(`session_id ${args.session_id} is not a cc-bridge consultation (see list_consultations)`)
+    if (args.cwd && args.cwd !== prev.cwd) return fail(`consultation ${args.session_id} works in ${prev.cwd}; cwd cannot change on follow-up`)
+  }
+  const cliArgs = consultArgs(prev?.session_id)
+  const cwd = prev?.cwd || args.cwd || process.cwd()
   return new Promise(resolve => {
     const child = spawn(claudeBin(), cliArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
     let out = ''
@@ -177,7 +217,6 @@ function consult(args) {
         return
       }
       if (result.session_id) {
-        const prev = loadConsultations().find(c => c.session_id === result.session_id)
         saveConsultation({
           session_id: result.session_id,
           label: args.label || prev?.label || String(args.prompt).slice(0, 60),
@@ -219,12 +258,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'bridge_status':
         return await status(args)
       case 'pair_with_claude': {
-        const thread = myThread(args)
-        if (!thread) return fail('cannot tell which Codex thread this is; pass codex_thread (run: echo $CODEX_THREAD_ID)')
-        const replaced = pairSessions(String(args.session), thread)
-        const note = replaced.filter(r => r.claude !== args.session || r.codex !== thread)
-        return text(`paired Claude session "${args.session}" ⇄ Codex thread ${thread}` +
-          (note.length ? `\nreplaced: ${note.map(r => `"${r.claude}" ⇄ ${r.codex}`).join(', ')}` : ''))
+        const thread = verifiedThread(args)
+        const { pair, replaced } = await pairLive(String(args.session), thread)
+        return text(`paired Claude session "${args.session}" (conversation ${pair.claude_session}) ⇄ Codex thread ${thread}` +
+          (replaced.length ? `\nreplaced: ${replaced.map(r => `"${r.claude}" ⇄ ${r.codex}`).join(', ')}` : ''))
       }
       case 'consult_claude':
         return await consult(args)

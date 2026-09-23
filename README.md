@@ -6,7 +6,7 @@ A local two-way bridge between a live Claude Code session and a live Codex sessi
 |---|---|
 | Codex → Claude | `codex-mcp.js` → user-only Unix socket → `claude-channel.js` → [Claude Channel](https://code.claude.com/docs/en/channels-reference) event |
 | Claude → Codex | `claude-channel.js` → `codex queue --thread <uuid>` → Codex handles it at its next turn |
-| Codex → separate Claude | `consult_claude` runs `claude -p` with only Read/Grep/Glob, and `session_id` lets it follow up |
+| Codex → separate Claude | `consult_claude` runs `claude -p --restricted` with only Read/Grep/Glob (no user hooks, plugins or MCP), and `session_id` lets it follow up |
 
 Bridge messages ask for discussion or review. They never authorize edits, state-changing commands or deploys.
 
@@ -31,7 +31,7 @@ ln -s ~/Work/claude-codex-bridge/bin/cc-bridge ~/.local/bin/cc-bridge
 2. In Codex, restart the session or reload MCP so the `cc-bridge` tools appear. Then ask it to pair:
    > Pair with Claude session "claude" using cc-bridge.
 
-   Codex runs `echo $CODEX_THREAD_ID` and calls `pair_with_claude`. You can also pair by hand:
+   Codex runs `echo $CODEX_THREAD_ID` and calls `pair_with_claude`. The pairing binds that exact Claude conversation (`CLAUDE_CODE_SESSION_ID`). A later conversation that reuses the label has to be paired again. You can also pair by hand while `claude-live` is running:
    ```
    cc-bridge pair --claude claude --codex <thread-uuid>
    ```
@@ -57,7 +57,10 @@ cc-bridge log -n 20     # transcript with delivery status
 
 ## Guarantees
 
-- **Addressing:** pairings are one-to-one between a Claude label and a Codex thread UUID. A message goes only to its paired session and is never rerouted.
+- **Addressing:** pairings are one-to-one between a Claude conversation (its label plus `CLAUDE_CODE_SESSION_ID`) and a Codex thread UUID. A message goes only to its paired conversation and is never rerouted. If the label now belongs to a different conversation, the send fails with `session_changed`.
+- **Verified Codex identity:** the `codex_thread` a Codex agent passes must be one of the threads whose `rollout-*.jsonl` the parent Codex process has open (`/proc/<ppid>/fd`). The bridge never infers a thread from the recipient.
+- **Socket ownership:** each label is owned through a PID lock file. A socket is replaced only when its owner process is gone, never because the owner was slow to answer, and cleanup removes only the process's own socket.
+- **Consultations:** a follow-up can resume only a `session_id` this bridge created, and always runs in that consultation's original directory.
 - **Delivery status:** sends are asynchronous. Codex-bound messages report `queued`; Claude-bound messages report `delivered`, `disconnected`, `unknown session` or `timeout`. Failed sends are never retried automatically.
 - **Loop limits:** each message accepts one reply, an exchange is capped at 20 messages, and duplicate `msg_id`s are dropped. Tool descriptions tell both agents not to send acknowledgement-only replies.
 - **Private storage:**
@@ -66,14 +69,14 @@ cc-bridge log -n 20     # transcript with delivery status
 
 ## Quirks
 
-- Codex removes `XDG_RUNTIME_DIR` and `CODEX_THREAD_ID` from MCP server environments. The bridge falls back to `/run/user/<uid>`, and Codex passes `codex_thread` explicitly.
+- Codex removes `XDG_RUNTIME_DIR` and `CODEX_THREAD_ID` from MCP server environments. The bridge falls back to `/run/user/<uid>`. Codex passes `codex_thread` explicitly, and the bridge checks it against the parent process. It may be omitted only when the Codex process has exactly one thread open.
+- A Claude `/clear` inside the same process keeps the MCP server running with the old conversation id, so re-pair after `/clear`.
 - A Codex thread handles queued messages at its next turn boundary. An idle Codex TUI picks them up immediately; a closed thread picks them up when resumed.
 - Custom channels are a research-preview Claude Code feature and require `--dangerously-load-development-channels`. That flag skips only the channel allowlist. Tool permissions are unchanged.
 
 ## Test
 
 ```
-npm test
+npm test                                         # both servers end to end, fake codex/claude binaries
+CC_BRIDGE_LIVE=1 node --test test/live.test.js   # real claude: no hooks, read-only tools, writes blocked
 ```
-
-The tests run both servers end to end, with fake `codex`/`claude` binaries and isolated directories.
