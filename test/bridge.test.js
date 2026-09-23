@@ -443,7 +443,22 @@ test('Codex with no connection starts a new Claude conversation that pairs itsel
   const before = queued().length
   assert.ok((await fresh.call('reply', { msg_id: n.params.meta.msg_id, text: 'yes' })).ok)
   assert.deepEqual((await waitFor(() => queued()[before])).slice(0, 3), ['queue', '--thread', T9])
+
+  // /clear: another conversation now holds the label. The next send must start a new
+  // Claude under an unused label, not the occupied one.
   await fresh.client.close()
+  await waitFor(() => !fs.existsSync(sockFile(label)))
+  const cleared = await startClaude(label, 'conv-cleared')
+  await waitFor(() => fs.existsSync(sockFile(label)))
+  const launches2 = launched().length
+  const r2 = await lone.call('send_to_claude', { text: 'after clear', as_thread: T9, project_dir: tmp })
+  assert.ok(r2.ok, r2.text)
+  assert.equal((await waitFor(() => launched()[launches2])).argv[1], `CC_BRIDGE_LABEL=${label}-2`)
+  assert.equal(cleared.notifications.filter(channel).length, 0)
+  const next = await startClaude(`${label}-2`, 'conv-next')
+  assert.equal((await waitFor(() => next.notifications.filter(channel)[0])).params.content, 'after clear')
+  await next.client.close()
+  await cleared.client.close()
   await lone.client.close()
 })
 
@@ -483,8 +498,12 @@ test('Claude reopens its paired Codex thread when it is not running', async () =
   const r = await c.call('send_to_codex', { text: 'are you there?' })
   assert.ok(r.ok, r.text)
   assert.match(r.text, /wasn't running, so it was reopened/)
-  assert.deepEqual((await waitFor(() => queued()[before])).slice(0, 3), ['queue', '--thread', T11])
+  const r2 = await c.call('send_to_codex', { text: 'hello?' }) // Codex still starting up
+  assert.match(r2.text, /already reopening/)
+  assert.deepEqual((await waitFor(() => queued()[before + 1])).slice(0, 3), ['queue', '--thread', T11])
   assert.deepEqual((await waitFor(() => launched()[launches])).argv.slice(1, 3), ['resume', T11])
+  await new Promise(r => setTimeout(r, 300))
+  assert.equal(launched().length, launches + 1, 'one terminal, not two')
   await c.client.close()
 })
 
@@ -495,7 +514,18 @@ test('the channel is dormant unless Claude was started with it', async () => {
   assert.ok(!fs.existsSync(sockFile('dormant')))
   await d.client.close()
 
-  const { launchedWithChannel } = await import('../lib/claude-process.js')
+  const { launchedWithChannel, sweepLifecycleDirs } = await import('../lib/claude-process.js')
+  // Lifecycle state is swept only once its Claude process (pid + start time) has ended.
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8')
+  const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+  const live = path.join(env.CC_BRIDGE_RUNTIME_DIR, `proc-${process.pid}-${start}`)
+  const gone = path.join(env.CC_BRIDGE_RUNTIME_DIR, `proc-${process.pid}-1`)
+  for (const d of [live, gone]) fs.mkdirSync(d, { recursive: true })
+  sweepLifecycleDirs()
+  assert.ok(fs.existsSync(live))
+  assert.ok(!fs.existsSync(gone))
+  fs.rmSync(live, { recursive: true })
+
   assert.ok(launchedWithChannel(['claude', '--dangerously-load-development-channels', 'plugin:cc-bridge@cc-bridge', '--continue']))
   assert.ok(launchedWithChannel(['claude', '--channels=plugin:other@x,plugin:cc-bridge@local']))
   assert.ok(!launchedWithChannel(['claude', '--continue']))

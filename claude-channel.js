@@ -28,8 +28,8 @@ import {
 } from './lib/common.js'
 import { deliverToCodex } from './lib/deliver.js'
 import { identity } from './lib/lifecycle.js'
-import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor } from './lib/claude-process.js'
-import { RESUME_PROMPT, addPending, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
+import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor, sweepLifecycleDirs } from './lib/claude-process.js'
+import { RESUME_PROMPT, START_TIMEOUT_MS, addPending, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
 
 const label = process.env.CC_BRIDGE_LABEL || 'claude'
 if (!validLabel(label)) {
@@ -130,6 +130,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: active ? TOO
 // send_to_codex, starting or reopening Codex when needed. Serialized so two quick
 // sends can't open two Codex windows.
 let sendChain = Promise.resolve()
+const resuming = new Map() // Codex thread → when we opened a terminal to resume it
 function sendNewToCodex(body) {
   const run = sendChain.then(() => sendNew(body))
   sendChain = run.catch(() => {})
@@ -145,8 +146,13 @@ async function sendNew(body) {
     if (codexThreadRunning(pair.codex)) return sendToPairedCodex(body, null, 'message')
     const res = await deliverToCodex({ fromLabel: label, claudeSession: mySession, thread: pair.codex, text: body, kind: 'message' })
     if (res.status !== 'queued') return fail(`not delivered to Codex thread ${pair.codex}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
-    await launchCodex(cwd, ['resume', pair.codex, RESUME_PROMPT])
-    return text(`Codex thread ${pair.codex} wasn't running, so it was reopened in a new terminal in ${cwd}. ` +
+    // Codex takes a while to open its rollout; don't open a second terminal meanwhile.
+    const opening = Date.now() - (resuming.get(pair.codex) || 0) < START_TIMEOUT_MS
+    if (!opening) {
+      await launchCodex(cwd, ['resume', pair.codex, RESUME_PROMPT])
+      resuming.set(pair.codex, Date.now())
+    }
+    return text(`Codex thread ${pair.codex} wasn't running, so it ${opening ? 'is already reopening' : 'was reopened in a new terminal'} in ${cwd}. ` +
       `Message queued (msg_id ${res.msg_id}); the answer arrives later as a channel event.`)
   }
   const { launch, stale } = addPending('codex', label, { claude_session: mySession, cwd }, body)
@@ -387,9 +393,10 @@ if (!active) {
   // Dormant: this Claude session wasn't started with the channel.
   process.stdin.on('close', () => process.exit(0))
 } else try {
-  if (pluginLifecycleDir) {
-    process.on('exit', () => fs.rmSync(pluginLifecycleDir, { recursive: true, force: true }))
-  }
+  // Lifecycle state belongs to the Claude process, not to this server: a restarted
+  // server in the same conversation needs it (no new SessionStart would restore it).
+  // State of Claude processes that have ended is swept here instead.
+  if (pluginLifecycleDir) sweepLifecycleDirs()
   await listen()
   listening = true
   watchPendingFromCodex()

@@ -32,7 +32,7 @@ import {
 } from './lib/common.js'
 import { deliverToClaude } from './lib/deliver.js'
 import { connectClaude, listSessions, formatSessions } from './lib/discovery.js'
-import { addPending, launchClaude, takePending } from './lib/launch.js'
+import { START_TIMEOUT_MS, addPending, launchClaude, readPending, takePending } from './lib/launch.js'
 
 const CONSULT_TIMEOUT_MS = 10 * 60 * 1000
 const claudeBin = () => process.env.CC_BRIDGE_CLAUDE_BIN || 'claude'
@@ -201,14 +201,31 @@ async function launchOrForget(label, launch) {
 // No connection: start a NEW Claude conversation under a fresh label; it pairs with
 // this thread and receives the message as soon as its channel is up.
 async function startNewClaude(thread, cwd, body, oldLabel) {
-  const base = `codex-${thread.slice(0, 8)}`
-  let label = base
-  for (let i = 2; loadPairs()[label] && loadPairs()[label].codex !== thread; i++) label = `${base}-${i}`
+  const label = await freshLabel(thread)
   const { launch } = addPending('claude', label, { codex: thread, claude_session: null }, body)
   if (launch) await launchOrForget(label, () => launchClaude(cwd, label))
   return text(`This thread had no running Claude connection${oldLabel ? ` ("${oldLabel}" now belongs to another conversation)` : ''}, ` +
     `so a new Claude conversation "${label}" ${launch ? 'was started' : 'is already starting'} in a terminal in ${cwd}. ` +
     'The message is delivered once it starts; approve the prompts there. The answer arrives later as a queued message.')
+}
+
+// A label for a new Claude conversation: one already starting for this thread (so a
+// second send joins it), otherwise one with no pairing, no live channel and no
+// pending start. A label a /clear-ed conversation still holds is never reused.
+async function freshLabel(thread) {
+  const base = `codex-${thread.slice(0, 8)}`
+  const candidates = [base, ...Array.from({ length: 50 }, (_, i) => `${base}-${i + 2}`)]
+  for (const label of candidates) {
+    const pending = readPending('claude', label)
+    if (pending && pending.codex === thread && pending.claude_session === null && Date.now() - pending.started_at < START_TIMEOUT_MS) return label
+  }
+  for (const label of candidates) {
+    const pending = readPending('claude', label)
+    if (loadPairs()[label] || (pending && Date.now() - pending.started_at < START_TIMEOUT_MS)) continue
+    if ((await sendToClaudeSocket(label, { op: 'ping' }, 1000)).status !== 'disconnected') continue
+    return label
+  }
+  throw new Error(`no free Claude label left for ${base}; clean up with cc-bridge unpair`)
 }
 
 // Messages Claude left while this Codex was being started for it.
