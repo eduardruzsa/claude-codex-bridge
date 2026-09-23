@@ -101,6 +101,11 @@ test('claude-live enables the plugin channel and forwards arguments', () => {
   fs.writeFileSync(echo, '#!/bin/sh\nprintf "%s\\n" "$@"\n', { mode: 0o755 })
   const out = execFileSync(path.join(root, 'bin', 'claude-live'), ['--resume', "it's"], { env: { ...process.env, CC_BRIDGE_CLAUDE_BIN: echo }, encoding: 'utf8' })
   assert.deepEqual(out.trim().split('\n'), ['--dangerously-load-development-channels', 'plugin:cc-bridge@cc-bridge', '--resume', "it's"])
+  // Aliased as `claude`: subcommands and --version pass through without the channel flag.
+  for (const args of [['mcp', 'list'], ['update'], ['--version'], ['plugin', 'list']]) {
+    const plain = execFileSync(path.join(root, 'bin', 'claude-live'), args, { env: { ...process.env, CC_BRIDGE_CLAUDE_BIN: echo }, encoding: 'utf8' })
+    assert.deepEqual(plain.trim().split('\n'), args)
+  }
 })
 
 test('plugin manifests wire the channel server and lifecycle hooks', () => {

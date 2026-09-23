@@ -20,6 +20,9 @@ The Claude side is a plugin, and its channel loads in every Claude session. It s
 
 ## Daily use
 
+To use plain `claude`, add `alias claude="claude-live"` to your shell rc. Subcommands (`claude mcp`, `claude update`, `--version`, …) pass through unchanged, and scripts still reach the real binary. Plain `codex` works as is.
+
+
 1. In your project directory, start Claude:
    ```sh
    claude-live

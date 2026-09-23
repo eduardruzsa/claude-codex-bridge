@@ -1,5 +1,11 @@
 #!/bin/sh
 # Claude Code with the cc-bridge channel enabled (needs the cc-bridge plugin; see
 # cc-bridge install). Arguments pass through, e.g. --continue or --resume <id>.
-# CC_BRIDGE_LABEL names the session (default "claude").
-exec "${CC_BRIDGE_CLAUDE_BIN:-claude}" --dangerously-load-development-channels plugin:cc-bridge@cc-bridge "$@"
+# CC_BRIDGE_LABEL names the session (default "claude"). Safe to alias as `claude`:
+# subcommands (claude mcp, claude update, ...) and --version/--help run unchanged.
+claude="${CC_BRIDGE_CLAUDE_BIN:-claude}"
+case "$1" in
+  agents|attach|auth|auto-mode|doctor|gateway|import|install|logs|mcp|plugin|plugins|project|respawn|rm|setup-token|stop|kill|ultrareview|update|upgrade|-v|--version|-h|--help)
+    exec "$claude" "$@" ;;
+esac
+exec "$claude" --dangerously-load-development-channels plugin:cc-bridge@cc-bridge "$@"
