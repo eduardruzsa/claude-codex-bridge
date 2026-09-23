@@ -43,6 +43,13 @@ Setup installs the locked dependencies and then:
 
 It is safe to run again: other MCP servers and hooks are kept, and it never overwrites a file or registration that isn't its own. Keep the repository where you cloned it, because Codex runs the MCP server from there. Restart Codex afterwards.
 
+Setup checks for a terminal launcher. Without `xdg-terminal-exec`, set your terminal first, from the clone:
+
+```sh
+node bin/cc-bridge config set terminal '["kitty", "--directory", "{cwd}", "--title", "{title}"]'
+npm run setup
+```
+
 Then run `cc-bridge doctor`.
 
 **Updating:** `git pull && npm ci && cc-bridge install`, then restart Codex and any `claude-live` sessions.
@@ -64,7 +71,9 @@ Then run `cc-bridge doctor`.
 
 To use plain `claude`, add `alias claude="claude-live"` to your shell rc. Subcommands (`claude mcp`, `claude update`, `--version`, …) pass through unchanged. Plain `codex` works as is.
 
-Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation, tell it **"Connect to Claude session <label>"** (`cc-bridge sessions` lists them). For a second Claude conversation alongside the first:
+Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation, tell it **"Connect to Claude session <label>"** (`cc-bridge sessions` lists them).
+
+Each running Claude conversation has a **label** (`claude` by default). Run as many `claude-live` sessions as you like: when `claude` is taken, the next one gets `claude-2`, then `claude-3`, and so on. A resumed conversation gets back the label it is paired under, if that label is free. To choose the name yourself, set it explicitly; an explicit label is never swapped for another one:
 
 ```sh
 CC_BRIDGE_LABEL=review claude-live
@@ -89,9 +98,9 @@ cc-bridge config set plan_review.review_claude_plans true
 | `claude_bin` | `"claude"` | Claude Code command | `CC_BRIDGE_CLAUDE_BIN` |
 | `codex_bin` | `"codex"` | Codex command | `CC_BRIDGE_CODEX_BIN` |
 | `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses `xdg-terminal-exec` | `CC_BRIDGE_TERMINAL` (space-separated) |
-| `default_label` | `"claude"` | Session label of `claude-live` | `CC_BRIDGE_LABEL` |
-| `data_dir` | `null` | Pairings, transcript, token. `null`: `~/.local/share/cc-bridge` | `CC_BRIDGE_DATA_DIR` |
-| `runtime_dir` | `null` | Sockets and launch state. `null`: `$XDG_RUNTIME_DIR/cc-bridge` | `CC_BRIDGE_RUNTIME_DIR` |
+| `default_label` | `"claude"` | Label of a `claude-live` session; when taken, the next free `<label>-2`, `<label>-3`, … is used | `CC_BRIDGE_LABEL` (exact label, no fallback) |
+| `data_dir` | `null` | Pairings, transcript, token; use a directory only the bridge uses. `null`: `~/.local/share/cc-bridge` | `CC_BRIDGE_DATA_DIR` |
+| `runtime_dir` | `null` | Sockets and launch state; use a directory only the bridge uses. `null`: `$XDG_RUNTIME_DIR/cc-bridge` | `CC_BRIDGE_RUNTIME_DIR` |
 | `plan_review.review_claude_plans` | `false` | Codex reviews Claude's plans | `CC_BRIDGE_PLAN_REVIEW=0/1` |
 | `plan_review.review_codex_plans` | `false` | Claude reviews Codex's plans (run `cc-bridge install` after changing) | `CC_BRIDGE_PLAN_REVIEW=0/1` |
 | `plan_review.timeout_seconds` | `480` | Longest a plan review may take (max 540) | |
@@ -125,7 +134,7 @@ The Claude hook ships in the plugin and follows the config right away. The Codex
 ## Security model
 
 - **Messages are requests, not permissions.** A bridge message asks for discussion or review. It never grants permission to edit, run state-changing commands or deploy. Both interactive agents keep their normal approval settings; the bridge bypasses none of them.
-- **Local and per-user.** Messages travel over a Unix socket in a `0700` runtime directory, authenticated with a random token in a `0700`/`0600` data directory. Nothing listens on the network.
+- **Local and per-user.** Messages travel over a Unix socket in a `0700` runtime directory, authenticated with a random token in a `0700`/`0600` data directory. Nothing listens on the network. Other users on the machine can't reach the bridge, but processes running as **your** user (and root) can read the token and transcript and are trusted, as they are for your agents' own files.
 - **Identity from the hosts, not the model.** Codex supplies the calling thread through host metadata (`_meta.threadId`), which is cross-checked against the rollout files the Codex process has open. Claude pairings bind to the exact conversation ID. `project_dir` only narrows the candidates; it is not a credential.
 - **No rerouting.** A message never moves to another conversation. After `/clear` or a switched conversation, sends are refused until you reconnect explicitly. Sends are not retried, each message accepts one reply, and an exchange is capped at `max_exchange_depth`.
 - **Read-only helpers.** `consult_claude` and the Claude plan reviewer run `claude -p --restricted` with Read/Grep/Glob only and no MCP servers. The Codex plan reviewer runs `codex exec` in a read-only sandbox with hooks, plugins, apps and every configured MCP server disabled. If it can't be isolated, it doesn't run.
@@ -156,12 +165,14 @@ cc-bridge unpair --claude review
 
 ## Uninstall
 
+Close Claude and Codex first, so nothing recreates the bridge's state. Then run **one** of:
+
 ```sh
-cc-bridge uninstall            # Codex MCP server + hook, Claude plugin + marketplace, ~/.local/bin links
-cc-bridge uninstall --purge    # also pairings, transcript, token, sockets and the config file
+cc-bridge uninstall           # Codex MCP server + hook, Claude plugin + marketplace, ~/.local/bin links
+cc-bridge uninstall --purge   # the same, plus pairings, transcript, token, sockets and the config file
 ```
 
-It removes only entries that are recognisably the bridge's and reports anything it left alone. `--purge` deletes bridge-owned files by name and leaves any other files in those directories. Then delete the cloned repository.
+It removes only entries that are recognisably the bridge's and reports anything it left alone. `--purge` deletes files by the bridge's own name patterns and keeps any subdirectory that holds something else. If you uninstalled without `--purge` and want the data gone too, run `node bin/cc-bridge uninstall --purge` from the clone (the `cc-bridge` link is gone by then). Then delete the cloned repository.
 
 ## Agent tools
 

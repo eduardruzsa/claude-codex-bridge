@@ -37,6 +37,7 @@ const configFile = path.join(tmp, 'config.json')
 fs.writeFileSync(configFile, JSON.stringify({ plan_review: { review_claude_plans: true, review_codex_plans: true } }))
 const baseEnv = {
   ...process.env,
+  CODEX_HOME: path.join(tmp, 'codex-home'), // never read the user's Codex sessions
   CC_BRIDGE_CONFIG: configFile,
   CC_BRIDGE_CODEX_BIN: path.join(tmp, 'codex'),
   CC_BRIDGE_CLAUDE_BIN: path.join(tmp, 'claude'),

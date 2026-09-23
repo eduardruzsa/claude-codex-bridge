@@ -29,7 +29,7 @@ import {
 import { deliverToCodex } from './lib/deliver.js'
 import { identity } from './lib/lifecycle.js'
 import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor, sweepLifecycleDirs } from './lib/claude-process.js'
-import { config } from './lib/config.js'
+import { loadConfig } from './lib/config.js'
 import { version } from './lib/version.js'
 import { RESUME_PROMPT, addPending, startTimeoutMs, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
 
@@ -37,8 +37,11 @@ import { RESUME_PROMPT, addPending, startTimeoutMs, bootstrapPrompt, codexThread
 // every tool call, and does not listen.
 let configError = null
 let label = process.env.CC_BRIDGE_LABEL || 'claude'
+// An explicit CC_BRIDGE_LABEL is used as is; the default one may be replaced by a
+// free label when another session holds it (see labelCandidates).
+const labelExplicit = !!process.env.CC_BRIDGE_LABEL
 try {
-  label = config().default_label
+  label = loadConfig().values.default_label
 } catch (err) {
   configError = err.message
 }
@@ -46,7 +49,7 @@ if (!validLabel(label)) {
   console.error(`cc-bridge: invalid CC_BRIDGE_LABEL "${label}"`)
   process.exit(1)
 }
-const me = claudeParty(label)
+let me = claudeParty(label) // final once listen() has claimed a label
 const claudeProc = findClaudeProcess()
 const active = channelActive(claudeProc)
 // Plugin mode: the SessionStart/SessionEnd hooks keep this Claude process's
@@ -74,7 +77,7 @@ const mcp = new Server(
   {
     capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
     instructions: !active ? 'cc-bridge is inactive in this session. To talk with Codex, restart Claude with claude-live.' :
-      `This session is bridged to a Codex session as Claude session "${label}". ` +
+      'This session is bridged to Codex over cc-bridge (bridge_status shows its label and pairing). ' +
       'Codex messages arrive as <channel source="cc-bridge" msg_id="..." from="codex:<thread>" kind="message|reply" in_reply_to="...">. ' +
       'To answer one, call the `reply` tool with its msg_id. To start a new exchange with Codex, call `send_to_codex`; ' +
       'if no Codex is running it opens a new Codex session in a terminal in this directory. ' +
@@ -337,18 +340,31 @@ function serve(conn) {
   conn.on('error', () => {})
 }
 
-// Exclusive ownership of the label: a Linux abstract-namespace socket bound only as a
+class LabelTaken extends Error {}
+
+// Exclusive ownership of a label: a Linux abstract-namespace socket bound only as a
 // mutex (name from labelMutexName). The kernel allows one binder and releases it when
 // the process dies, so there is no stale lock to recover and no read-then-delete race.
-function acquireLabel() {
+function acquireLabel(name) {
   const mutex = net.createServer(c => c.destroy())
   return new Promise((resolve, reject) => {
-    mutex.once('error', err =>
-      reject(err.code === 'EADDRINUSE'
-        ? new Error(`another live Claude session already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
-        : err))
-    mutex.listen(labelMutexName(label), () => resolve(mutex))
+    mutex.once('error', err => reject(err.code === 'EADDRINUSE' ? new LabelTaken(`another live Claude session already uses label "${name}"`) : err))
+    mutex.listen(labelMutexName(name), () => resolve(mutex))
   })
+}
+
+// Labels to try, in order. An explicit CC_BRIDGE_LABEL: only that one. Otherwise the
+// label paired with this conversation (so a resumed conversation gets its Codex
+// thread back), then the default, then default-2, default-3, ...
+function labelCandidates() {
+  if (labelExplicit) return [label]
+  const session = process.env.CLAUDE_CODE_SESSION_ID
+  let paired = []
+  try {
+    paired = Object.entries(loadPairs()).filter(([, p]) => session && p.claude_session === session).map(([l]) => l)
+  } catch {}
+  const numbered = Array.from({ length: 19 }, (_, i) => `${label}-${i + 2}`)
+  return [...new Set([...paired, label, ...numbered])].filter(validLabel)
 }
 
 // An existing socket file is removed only when provably dead (nothing accepts on it).
@@ -368,14 +384,13 @@ function socketIsDead(sockPath) {
   })
 }
 
-async function listen() {
-  if (configError) throw new Error(configError)
-  if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && !pluginLifecycleDir && !currentIdentity().ready) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
-  const sockPath = paths.socket(label)
-  const mutex = await acquireLabel()
+// Claims `name` and listens on its socket; LabelTaken if a live session has it.
+async function bindLabel(name) {
+  const sockPath = paths.socket(name)
+  const mutex = await acquireLabel(name)
   try {
     if (fs.existsSync(sockPath)) {
-      if (!(await socketIsDead(sockPath))) throw new Error(`a live process is still serving ${sockPath}; not replacing it`)
+      if (!(await socketIsDead(sockPath))) throw new LabelTaken(`a live process is still serving ${sockPath}; not replacing it`) // e.g. an owner in another network namespace
       fs.unlinkSync(sockPath)
     }
     const server = net.createServer(serve)
@@ -386,6 +401,32 @@ async function listen() {
   } catch (err) {
     mutex.close() // don't keep the label while not listening
     throw err
+  }
+  return sockPath
+}
+
+async function listen() {
+  if (configError) throw new Error(configError)
+  if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && !pluginLifecycleDir && !currentIdentity().ready) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
+  const candidates = labelCandidates()
+  let sockPath = null
+  let taken = null
+  for (const name of candidates) {
+    try {
+      sockPath = await bindLabel(name)
+    } catch (err) {
+      if (!(err instanceof LabelTaken)) throw err
+      taken = err
+      continue
+    }
+    label = name
+    me = claudeParty(name)
+    break
+  }
+  if (!sockPath) {
+    throw new Error(labelExplicit
+      ? `${taken.message}; set CC_BRIDGE_LABEL to a different name`
+      : `labels ${candidates[0]} to ${candidates.at(-1)} are all used by live Claude sessions; set CC_BRIDGE_LABEL to another name`)
   }
   fs.chmodSync(sockPath, 0o600)
   const { ino, dev } = fs.statSync(sockPath)
