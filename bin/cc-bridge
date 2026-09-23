@@ -2,12 +2,12 @@
 // cc-bridge: manage Claude ⇄ Codex pairings and inspect the transcript.
 import {
   dataDir,
-  loadPairs,
   pairLive,
-  pairState,
   readTranscript,
   unpair,
 } from '../lib/common.js'
+import { install, doctor } from '../lib/admin.js'
+import { listSessions, formatSessions } from '../lib/discovery.js'
 
 const [cmd, ...rest] = process.argv.slice(2)
 const flag = name => {
@@ -16,12 +16,29 @@ const flag = name => {
 }
 
 const usage = `usage:
+  cc-bridge install
+  cc-bridge doctor
+  cc-bridge sessions
   cc-bridge pair --claude <label> --codex <thread-uuid>
   cc-bridge unpair --claude <label>
   cc-bridge status
   cc-bridge log [-n 20]`
 
 switch (cmd) {
+  case 'install':
+    try { console.log(install()) } catch (e) { console.error(e.message); process.exitCode = 1 }
+    break
+  case 'doctor': {
+    const checks = await doctor()
+    for (const c of checks) console.log(`${c.ok ? 'OK' : 'FAIL'} ${c.name}${c.ok ? '' : ` — ${c.fix}`}`)
+    console.log(formatSessions(await listSessions()))
+    console.log('Channels activation is confirmed only by a live round trip; no model calls were made.')
+    process.exitCode = checks.some(c => !c.ok) ? 1 : 0
+    break
+  }
+  case 'sessions':
+    console.log(formatSessions(await listSessions()))
+    break
   case 'pair': {
     const label = flag('claude')
     const thread = flag('codex')
@@ -45,16 +62,12 @@ switch (cmd) {
       console.error(usage)
       process.exit(2)
     }
-    console.log(unpair(label) ? `unpaired "${label}"` : `"${label}" was not paired`)
+    console.log(await unpair(label) ? `unpaired "${label}"` : `"${label}" was not paired`)
     break
   }
   case 'status': {
-    const pairs = Object.entries(loadPairs())
     console.log(`data: ${dataDir()}`)
-    if (!pairs.length) console.log('no pairings')
-    for (const [label, pair] of pairs) {
-      console.log(`claude "${label}" (conversation ${pair.claude_session}) ⇄ codex ${pair.codex}  [${await pairState(label, pair)}]`)
-    }
+    console.log(formatSessions(await listSessions()))
     break
   }
   case 'log': {

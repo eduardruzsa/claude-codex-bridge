@@ -1,0 +1,172 @@
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import { spawnSync, execFileSync } from 'node:child_process'
+import { after, test } from 'node:test'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { install, minimumNode, supportedNode, root } from '../lib/admin.js'
+import { launchArgs } from '../lib/launcher.js'
+import { transition } from '../lib/lifecycle.js'
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
+process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
+process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
+fs.mkdirSync(process.env.CC_BRIDGE_DATA_DIR, { mode: 0o700 })
+const fake = path.join(tmp, 'fake-agent')
+const config = path.join(tmp, 'config.json')
+fs.writeFileSync(config, JSON.stringify({ other: { command: 'preserve-me' } }))
+fs.writeFileSync(fake, `#!/usr/bin/env node
+const fs=require('fs');const p=${JSON.stringify(config)};const a=process.argv.slice(2);
+if(a[0]==='mcp') {
+ const c=JSON.parse(fs.readFileSync(p));
+ if(a[1]==='get') {if(!c[a[2]]){console.error('No MCP server named '+a[2]);process.exit(1)}console.log(JSON.stringify(c[a[2]]))}
+ if(a[1]==='add') {c[a[2]]={enabled:true,transport:{command:a[4],args:a.slice(5)}};fs.writeFileSync(p,JSON.stringify(c))}
+} else console.log('--thread --message --restricted Claude Code 2.1.280');
+`, { mode: 0o755 })
+process.env.CC_BRIDGE_CODEX_BIN = fake
+process.env.CC_BRIDGE_CLAUDE_BIN = fake
+const { connectClaude, listSessions, projectDir } = await import('../lib/discovery.js')
+const { pairLive, unpair } = await import('../lib/common.js')
+const T = '11111111-2222-3333-4444-555555555555'
+const U = '99999999-2222-3333-4444-555555555555'
+const clients = new Set()
+after(async () => {
+  for (const c of clients) await c.close()
+  fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+async function channel(label, cwd, lifecycle) {
+  const client = new Client({ name: 'ux-test', version: '1' })
+  const notifications = []
+  client.fallbackNotificationHandler = async n => notifications.push(n)
+  clients.add(client)
+  const env = { ...process.env, CC_BRIDGE_LABEL: label, CLAUDE_CODE_SESSION_ID: `${label}-session` }
+  delete env.CC_BRIDGE_LIFECYCLE_DIR
+  if (lifecycle) env.CC_BRIDGE_LIFECYCLE_DIR = lifecycle
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'claude-channel.js')], cwd, env }))
+  const deadline = Date.now() + 3000
+  while (!fs.existsSync(path.join(process.env.CC_BRIDGE_RUNTIME_DIR, `claude-${label}.sock`))) {
+    assert.ok(Date.now() < deadline, 'channel did not bind')
+    await new Promise(r => setTimeout(r, 10))
+  }
+  return { client, notifications }
+}
+async function close(c) { await c.client.close(); clients.delete(c.client) }
+function hook(dir, sid, event, source = 'startup', cwd = tmp) {
+  const run = spawnSync(process.execPath, [path.join(root, 'bin/lifecycle-hook.js'), dir], {
+    input: JSON.stringify({ session_id: sid, hook_event_name: event, source, cwd }), encoding: 'utf8',
+  })
+  assert.equal(run.status, 0, run.stderr)
+}
+
+test('installer is repeatable, preserves other servers and rejects conflicts before changing links', () => {
+  const home = path.join(tmp, 'home')
+  install({ home })
+  const first = fs.readFileSync(config, 'utf8')
+  install({ home })
+  assert.equal(fs.readFileSync(config, 'utf8'), first)
+  assert.equal(JSON.parse(first).other.command, 'preserve-me')
+  assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
+  const conflictingHome = path.join(tmp, 'conflict')
+  fs.mkdirSync(path.join(conflictingHome, '.local/bin'), { recursive: true })
+  fs.writeFileSync(path.join(conflictingHome, '.local/bin/claude-live'), 'valuable')
+  assert.throws(() => install({ home: conflictingHome }), /Refusing to overwrite/)
+  assert.equal(fs.existsSync(path.join(conflictingHome, '.local/bin/cc-bridge')), false)
+  const original = JSON.parse(first)
+  fs.writeFileSync(config, JSON.stringify({ ...original, 'cc-bridge': { command: '/unrelated' } }))
+  assert.throws(() => install({ home }), /Conflicting cc-bridge/)
+  assert.equal(JSON.parse(fs.readFileSync(config)).other.command, 'preserve-me')
+  fs.writeFileSync(config, first)
+  assert.ok(supportedNode(minimumNode))
+  assert.ok(!supportedNode('22.23.1'))
+})
+
+test('launcher preserves CLI settings/hooks, safely quotes paths, and forwards resume', () => {
+  const user = { hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'user-hook' }] }], Stop: [{ hooks: [] }] }, model: 'user-model' }
+  const args = launchArgs(['--settings', JSON.stringify(user), '--resume', 'session'], "/tmp/repo's name", '/tmp/launch', 'review')
+  const settings = JSON.parse(args[args.indexOf('--settings') + 1])
+  assert.equal(settings.model, user.model)
+  assert.equal(settings.hooks.SessionStart[0].hooks[0].command, 'user-hook')
+  assert.equal(settings.hooks.SessionStart.length, 2)
+  assert.deepEqual(settings.hooks.Stop, user.hooks.Stop)
+  assert.match(settings.hooks.SessionStart[1].hooks[0].command, /repo'\\''s name/)
+  assert.deepEqual(args.slice(-2), ['--resume', 'session'])
+  const mcp = JSON.parse(args[args.indexOf('--mcp-config') + 1]).mcpServers['cc-bridge']
+  assert.equal(mcp.env.CC_BRIDGE_LIFECYCLE_DIR, '/tmp/launch')
+})
+
+test('project matching canonicalizes nested/symlink paths and keeps worktrees separate', () => {
+  const repo = path.join(tmp, 'project'), worktree = path.join(tmp, 'worktree')
+  fs.mkdirSync(repo)
+  const git = args => execFileSync('git', ['-C', repo, ...args], { stdio: 'ignore' })
+  git(['init']); git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'test'])
+  git(['worktree', 'add', '--detach', worktree])
+  try {
+    fs.mkdirSync(path.join(repo, 'nested'))
+    fs.symlinkSync(repo, path.join(tmp, 'alias'))
+    assert.equal(projectDir(path.join(repo, 'nested')), repo)
+    assert.equal(projectDir(path.join(tmp, 'alias')), repo)
+    assert.equal(projectDir(worktree), worktree)
+    assert.notEqual(projectDir(worktree), projectDir(repo))
+    // No modifications or untracked/ignored files exist in this temporary worktree.
+    assert.equal(execFileSync('git', ['-C', worktree, 'status', '--porcelain', '--ignored'], { encoding: 'utf8' }), '')
+  } finally { git(['worktree', 'remove', worktree]) }
+})
+
+test('discovery auto-connects only one eligible same-project conversation', async () => {
+  const cwd = path.join(tmp, 'discovery'); fs.mkdirSync(cwd)
+  await assert.rejects(connectClaude(T, cwd), /No unpaired/)
+  const a = await channel('discover-a', cwd)
+  assert.equal((await listSessions()).find(s => s.label === 'discover-a').state, 'available')
+  assert.equal((await connectClaude(T, cwd)).label, 'discover-a')
+  assert.equal((await connectClaude(T, cwd)).pair.codex, T)
+  await assert.rejects(connectClaude(U, cwd), /No unpaired/)
+  await unpair('discover-a')
+  const b = await channel('discover-b', cwd)
+  await assert.rejects(connectClaude(T, cwd), /Several Claude/)
+  assert.equal((await connectClaude(T, cwd, 'discover-b')).label, 'discover-b')
+  await close(b)
+  await assert.rejects(connectClaude(T, cwd), /Existing pairing.*not switching/)
+  await unpair('discover-b'); await close(a)
+})
+
+test('lifecycle rejects delayed events and allows same-conversation resume', () => {
+  const start = (sid, source = 'startup') => ({ session_id: sid, hook_event_name: 'SessionStart', source, cwd: tmp })
+  let s = transition(null, start('A'), '10')
+  s = transition(s, { session_id: 'A', hook_event_name: 'SessionEnd' }, '20')
+  assert.equal(s.ready, false)
+  assert.deepEqual(transition(s, start('A'), '15'), s)
+  assert.deepEqual(transition(s, start('A'), '25'), s)
+  s = transition(s, start('B', 'clear'), '30')
+  assert.equal(transition(s, { session_id: 'A', hook_event_name: 'SessionEnd' }, '35').ready, true)
+  assert.equal(transition(s, start('A', 'resume'), '40').session, 'A')
+})
+
+test('running channel refreshes lifecycle identity; changed conversations cannot inherit pairing or replies', async () => {
+  const dir = path.join(tmp, 'lifecycle'); fs.mkdirSync(dir, { mode: 0o700 })
+  const cwd = path.join(tmp, 'lifecycle-project'); fs.mkdirSync(cwd)
+  const c = await channel('lifecycle', cwd, dir)
+  const { sendToClaudeSocket } = await import('../lib/common.js')
+  const { deliverToClaude } = await import('../lib/deliver.js')
+  assert.equal((await sendToClaudeSocket('lifecycle', { op: 'ping' })).status, 'transitioning')
+  hook(dir, 'A', 'SessionStart', 'startup', cwd)
+  await pairLive('lifecycle', T)
+  const sent = await deliverToClaude({ fromThread: T, label: 'lifecycle', claudeSession: 'A', text: 'before clear' })
+  assert.equal(sent.status, 'delivered')
+  hook(dir, 'A', 'SessionEnd', 'clear', cwd)
+  assert.equal((await sendToClaudeSocket('lifecycle', { op: 'ping' })).status, 'transitioning')
+  hook(dir, 'B', 'SessionStart', 'clear', cwd)
+  assert.equal((await listSessions()).find(s => s.label === 'lifecycle').state, 'conversation-changed')
+  await assert.rejects(connectClaude(T, cwd), /Existing pairing/)
+  const late = await deliverToClaude({ fromThread: T, label: 'lifecycle', claudeSession: 'A', text: 'old message' })
+  assert.equal(late.status, 'session_changed')
+  await connectClaude(T, cwd, 'lifecycle')
+  const reply = await c.client.callTool({ name: 'reply', arguments: { msg_id: sent.msg_id, text: 'wrong conversation' } })
+  assert.equal(reply.isError, true)
+  hook(dir, 'B', 'SessionEnd', 'resume', cwd)
+  hook(dir, 'B', 'SessionStart', 'resume', cwd)
+  assert.equal((await connectClaude(T, cwd)).pair.claude_session, 'B')
+  await unpair('lifecycle'); await close(c)
+})

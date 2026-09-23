@@ -26,11 +26,25 @@ import {
   validateReply,
 } from './lib/common.js'
 import { deliverToClaude } from './lib/deliver.js'
+import { connectClaude, listSessions, formatSessions } from './lib/discovery.js'
 
 const CONSULT_TIMEOUT_MS = 10 * 60 * 1000
 const claudeBin = () => process.env.CC_BRIDGE_CLAUDE_BIN || 'claude'
 
 const TOOLS = [
+  {
+    name: 'list_sessions',
+    description: 'Discover live Claude conversations, their projects, exact identities and pairing state. Use before selecting between multiple conversations.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'connect_claude',
+    description: 'Connect before asking Claude. Reuses a valid pairing, otherwise connects only to the sole unpaired Claude in project_dir. If ambiguous or changed, ask the user to select a label, then pass session. Never choose a replacement silently.',
+    inputSchema: { type: 'object', properties: {
+      project_dir: { type: 'string', description: 'Absolute working directory of your current project (not the MCP server directory)' },
+      session: { type: 'string', description: 'Explicit user-selected Claude label; may replace an existing pairing' },
+    }, required: ['project_dir'] },
+  },
   {
     name: 'send_to_claude',
     description: `Start a new exchange with the paired live Claude Code session. Returns immediately with delivered/disconnected/unknown session; Claude's answer arrives later as a queued message in this thread. ${RULES}`,
@@ -176,6 +190,7 @@ async function status(meta) {
   const recent = readTranscript().filter(e => e.event === 'sent').slice(-10)
   for (const e of recent) lines.push(`  ${e.ts} ${e.kind} ${e.from} → ${e.to} msg_id=${e.msg_id}${e.reply_to ? ` in_reply_to=${e.reply_to}` : ''}`)
   if (!recent.length) lines.push('  (none)')
+  lines.push('sessions:', formatSessions(await listSessions()))
   return text(lines.join('\n'))
 }
 
@@ -231,8 +246,9 @@ const mcp = new Server(
   {
     capabilities: { tools: {} },
     instructions:
-      'cc-bridge connects this Codex thread to a live Claude Code session (Codex identifies the calling thread automatically). Claude messages arrive as ' +
-      '"[cc-bridge message|reply from Claude session ...]" with a msg_id; answer with `reply`. Start exchanges ' +
+      'cc-bridge connects this Codex thread to a live Claude Code session (Codex identifies the calling thread automatically). ' +
+      'When the user asks you to ask Claude, first call connect_claude with your current project directory; it handles unambiguous pairing. Use list_sessions and ask the user when selection is needed. ' +
+      'Claude messages arrive as "[cc-bridge message|reply from Claude session ...]" with a msg_id; answer with `reply`. Start exchanges ' +
       `with \`send_to_claude\`. Your ordinary output is NOT forwarded to Claude. ${RULES} ` +
       '`consult_claude` is a separate read-only Claude, independent of the live session.',
   },
@@ -245,6 +261,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const meta = req.params._meta
   try {
     switch (req.params.name) {
+      case 'list_sessions':
+        return text(JSON.stringify(await listSessions(), null, 2))
+      case 'connect_claude': {
+        const result = await connectClaude(callerThread(meta), args.project_dir, args.session)
+        return text(`Connected Claude "${result.label}" (${result.pair.claude_session}) ⇄ Codex ${result.pair.codex}`)
+      }
       case 'send_to_claude':
         return await sendToClaude(args, callerThread(meta))
       case 'reply':

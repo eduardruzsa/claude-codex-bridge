@@ -23,6 +23,7 @@ import {
   wasDelivered,
 } from './lib/common.js'
 import { deliverToCodex } from './lib/deliver.js'
+import { identity } from './lib/lifecycle.js'
 
 const label = process.env.CC_BRIDGE_LABEL || 'claude'
 if (!validLabel(label)) {
@@ -31,7 +32,11 @@ if (!validLabel(label)) {
 }
 const me = claudeParty(label)
 // The real Claude conversation id; pairings bind to it, not just to the label.
-const mySession = process.env.CLAUDE_CODE_SESSION_ID || null
+function currentSession() {
+  const state = identity()
+  if (!state.ready || !state.session) throw new Error('Claude conversation is transitioning or unavailable; wait for SessionStart or restart claude-live')
+  return state.session
+}
 let listening = false
 let listenError = null
 
@@ -82,6 +87,7 @@ const fail = t => ({ content: [{ type: 'text', text: t }], isError: true })
 
 // The pairing for this label, only if it belongs to this exact conversation.
 function myPair() {
+  const mySession = currentSession()
   const pair = loadPairs()[label]
   if (!pair) throw new Error(`Claude session "${label}" is not paired with a Codex thread. Pair it with: cc-bridge pair --claude ${label} --codex <thread-uuid>`)
   if (pair.claude_session !== mySession) {
@@ -93,6 +99,7 @@ function myPair() {
 async function sendToPairedCodex(body, replyToId, kind) {
   if (!listening) return fail(`bridge is not listening: ${listenError}`)
   const thread = myPair().codex
+  const mySession = currentSession()
   const res = await deliverToCodex({ fromLabel: label, claudeSession: mySession, thread, text: body, replyToId, kind })
   if (res.status !== 'queued') return fail(`not delivered to Codex thread ${thread}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
   return text(`queued for Codex thread ${thread} (msg_id ${res.msg_id}). Its answer, if any, arrives later as a channel event.`)
@@ -107,6 +114,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'send_to_codex':
         return await sendToPairedCodex(String(args.text || ''), null, 'message')
       case 'reply': {
+        const mySession = currentSession()
         const original = validateReply(String(args.msg_id), me, mySession)
         if (parseParty(original.from).side !== 'codex') return fail(`msg_id ${args.msg_id} did not come from Codex`)
         const paired = myPair().codex
@@ -115,6 +123,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return await sendToPairedCodex(String(args.text || ''), original.msg_id, 'reply')
       }
       case 'bridge_status': {
+        const mySession = identity().ready ? identity().session : 'transitioning/unavailable'
         const recent = readTranscript()
           .filter(e => e.event === 'sent' && (e.from === me || e.to === me))
           .slice(-10)
@@ -145,7 +154,9 @@ const claimed = new Set() // msg_ids accepted by this process, including in-flig
 
 async function handleRequest(req) {
   if (req.token !== authToken()) return { status: 'error', error: 'unauthorized' }
-  if (req.op === 'ping') return { status: 'ok', label, session: mySession }
+  const state = identity()
+  if (req.op === 'ping') return { status: state.ready ? 'ok' : 'transitioning', label, session: state.session, cwd: state.cwd, lifecycle: state.lifecycle }
+  const mySession = currentSession()
   if (req.op !== 'deliver') return { status: 'error', error: `unknown op ${req.op}` }
   if (req.to !== me) return { status: 'error', error: `this is ${me}, not ${req.to}` }
   if (req.claude_session !== mySession) {
@@ -239,7 +250,7 @@ function socketIsDead(sockPath) {
 }
 
 async function listen() {
-  if (!mySession) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
+  if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && !identity().ready) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
   const sockPath = paths.socket(label)
   const mutex = await acquireLabel()
   try {
