@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Start (or --resume/--continue) Claude Code with the cc-bridge channel enabled.
+# CC_BRIDGE_LABEL names this session for pairing (default "claude").
+set -euo pipefail
+root="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+label="${CC_BRIDGE_LABEL:-claude}"
+config=$(printf '{"mcpServers":{"cc-bridge":{"command":"node","args":["%s/claude-channel.js"],"env":{"CC_BRIDGE_LABEL":"%s"}}}}' "$root" "$label")
+exec claude --mcp-config "$config" --dangerously-load-development-channels server:cc-bridge "$@"

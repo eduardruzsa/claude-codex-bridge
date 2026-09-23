@@ -1,0 +1,22 @@
+{
+  "name": "claude-codex-bridge",
+  "version": "0.1.0",
+  "description": "Two-way local bridge between Claude Code (Channels) and Codex (MCP + codex queue)",
+  "directories": {
+    "lib": "lib",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "private": true,
+  "bin": {
+    "cc-bridge": "bin/cc-bridge",
+    "claude-live": "bin/claude-live"
+  },
+  "license": "UNLICENSED"
+}

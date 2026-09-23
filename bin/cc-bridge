@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+// cc-bridge: manage Claude ⇄ Codex pairings and inspect the transcript.
+import {
+  claudeSessionAlive,
+  dataDir,
+  loadPairs,
+  pairSessions,
+  readTranscript,
+  unpair,
+} from '../lib/common.js'
+
+const [cmd, ...rest] = process.argv.slice(2)
+const flag = name => {
+  const i = rest.indexOf(`--${name}`)
+  return i === -1 ? undefined : rest[i + 1]
+}
+
+const usage = `usage:
+  cc-bridge pair --claude <label> --codex <thread-uuid>
+  cc-bridge unpair --claude <label>
+  cc-bridge status
+  cc-bridge log [-n 20]`
+
+switch (cmd) {
+  case 'pair': {
+    const label = flag('claude')
+    const thread = flag('codex')
+    if (!label || !thread) {
+      console.error(usage)
+      process.exit(2)
+    }
+    const replaced = pairSessions(label, thread).filter(r => r.claude !== label || r.codex !== thread)
+    console.log(`paired claude "${label}" ⇄ codex ${thread}`)
+    for (const r of replaced) console.log(`replaced: claude "${r.claude}" ⇄ codex ${r.codex}`)
+    break
+  }
+  case 'unpair': {
+    const label = flag('claude')
+    if (!label) {
+      console.error(usage)
+      process.exit(2)
+    }
+    console.log(unpair(label) ? `unpaired "${label}"` : `"${label}" was not paired`)
+    break
+  }
+  case 'status': {
+    const pairs = Object.entries(loadPairs())
+    console.log(`data: ${dataDir()}`)
+    if (!pairs.length) console.log('no pairings')
+    for (const [label, thread] of pairs) {
+      const alive = await claudeSessionAlive(label)
+      console.log(`claude "${label}" ⇄ codex ${thread}  [claude ${alive ? 'connected' : 'disconnected'}]`)
+    }
+    break
+  }
+  case 'log': {
+    const n = Number(rest[rest.indexOf('-n') + 1]) || 20
+    const events = readTranscript()
+    const status = new Map()
+    for (const e of events) if (e.event !== 'sent') status.set(e.msg_id, e.event + (e.error ? ` (${e.error})` : ''))
+    for (const e of events.filter(e => e.event === 'sent').slice(-n)) {
+      console.log(`${e.ts}  ${e.kind}  ${e.from} → ${e.to}  [${status.get(e.msg_id) || 'pending'}]`)
+      console.log(`  msg_id=${e.msg_id}${e.reply_to ? `  in_reply_to=${e.reply_to}` : ''}`)
+      console.log(`  ${e.text.replace(/\n/g, '\n  ')}\n`)
+    }
+    break
+  }
+  default:
+    console.log(usage)
+    process.exit(cmd ? 2 : 0)
+}
