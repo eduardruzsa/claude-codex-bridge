@@ -10,6 +10,8 @@ import {
   codexReview,
   extractProposedPlan,
   isLgtm,
+  logReview,
+  planFromCodexTurn,
   markReviewedRound,
   takeReviewedRound,
 } from '../lib/plan-review.js'
@@ -28,14 +30,17 @@ if (side === '--claude') {
   try {
     review = await codexReview(plan, cwd)
   } catch (err) {
+    logReview(side, `unavailable: ${err.message}`, cwd)
     emit({ systemMessage: `Codex plan review unavailable (${err.message}); plan shown unreviewed.` })
     process.exit(0)
   }
   if (isLgtm(review)) {
+    logReview(side, 'lgtm', cwd, review)
     emit({ systemMessage: `Codex reviewed this plan: ${review.split('\n')[0]}` })
     process.exit(0)
   }
   markReviewedRound(input.session_id)
+  logReview(side, 'sent back to revise', cwd, review)
   emit({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -48,19 +53,22 @@ if (side === '--claude') {
   })
 } else if (side === '--codex') {
   if (input.stop_hook_active) process.exit(0) // already continued once for a review
-  const plan = extractProposedPlan(input.last_assistant_message)
+  const plan = extractProposedPlan(input.last_assistant_message) || planFromCodexTurn(input)
   if (!plan) process.exit(0)
   let review
   try {
     review = await claudeReview(plan, cwd)
   } catch (err) {
+    logReview(side, `unavailable: ${err.message}`, cwd)
     emit({ systemMessage: `Claude plan review unavailable (${err.message}); plan shown unreviewed.` })
     process.exit(0)
   }
   if (isLgtm(review)) {
+    logReview(side, 'lgtm', cwd, review)
     emit({ systemMessage: `Claude reviewed this plan: ${review.split('\n')[0]}` })
     process.exit(0)
   }
+  logReview(side, 'sent back to revise', cwd, review)
   emit({
     decision: 'block',
     reason:

@@ -34,6 +34,7 @@ Object.assign(env, {
   CC_BRIDGE_CODEX_BIN: path.join(tmp, 'codex'),
   CC_BRIDGE_CLAUDE_BIN: path.join(tmp, 'claude'),
   CC_BRIDGE_ACTIVE: '1', // these tests aren't started from a claude-live session
+  CC_BRIDGE_CLAUDE_PROC: 'none', // ...even when run from inside one
   CC_BRIDGE_TERMINAL: path.join(tmp, 'terminal'),
 })
 Object.assign(process.env, env) // so lib/common.js in this process sees the same dirs

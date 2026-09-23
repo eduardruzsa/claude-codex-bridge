@@ -1,6 +1,6 @@
 {
   "name": "cc-bridge",
   "description": "Two-way Claude Code ⇄ Codex bridge: a Claude Channel that talks to Codex sessions, starting them when needed. Active only in sessions started with claude-live.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "keywords": ["codex", "channel", "mcp", "bridge"]
 }

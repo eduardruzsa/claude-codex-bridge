@@ -38,6 +38,7 @@ const baseEnv = {
   CC_BRIDGE_CLAUDE_BIN: path.join(tmp, 'claude'),
   CC_BRIDGE_DATA_DIR: path.join(tmp, 'data'),
   CC_BRIDGE_PLAN_REVIEW: '',
+  CC_BRIDGE_CLAUDE_PROC: 'none',
 }
 function hook(side, input, review = '- step 2 misses the migration') {
   const r = spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), side], {
@@ -92,6 +93,36 @@ test('Codex plan: Claude findings continue the turn once; non-plan turns are unt
   assert.equal(hook('--codex', { last_assistant_message: msg, stop_hook_active: true, cwd: tmp }), null)
   assert.equal(hook('--codex', { last_assistant_message: 'just chatting', stop_hook_active: false, cwd: tmp }), null)
   assert.match(hook('--codex', { last_assistant_message: msg, cwd: tmp }, 'LGTM').systemMessage, /^Claude reviewed this plan: LGTM/)
+})
+
+test('Codex plan mode: the plan is a separate Plan item, not in last_assistant_message', () => {
+  // Same shape as a real Codex 0.156 plan-mode rollout: commentary is the "last" message.
+  const turn = '01a0cd82-e614-7e71-8c46-da15a51aaf68'
+  const session = '01a0cd82-6db5-76c1-93da-0bb66be86ce0'
+  const rollout = path.join(tmp, 'sessions', '2026', '09', '23', `rollout-2026-09-23T11-04-32-${session}.jsonl`)
+  fs.mkdirSync(path.dirname(rollout), { recursive: true })
+  fs.writeFileSync(rollout, [
+    { type: 'turn_context', payload: { turn_id: 'older-turn' } },
+    { type: 'event_msg', payload: { type: 'item_completed', turn_id: 'older-turn', item: { type: 'Plan', text: '# Old plan' } } },
+    { type: 'turn_context', payload: { turn_id: turn } },
+    { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Verified: all good.' }] } },
+    { type: 'event_msg', payload: { type: 'item_completed', turn_id: turn, item: { type: 'Plan', text: '# Sentiment plan\n1. Preserve research' } } },
+  ].map(e => JSON.stringify(e)).join('\n') + '\n')
+  const base = { hook_event_name: 'Stop', last_assistant_message: 'Verified: all good.', stop_hook_active: false, cwd: tmp }
+  for (const input of [
+    { ...base, transcript_path: rollout, turn_id: turn },
+    { ...base, session_id: session }, // no transcript_path: found under CODEX_HOME/sessions
+  ]) {
+    const r = spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), '--codex'], {
+      input: JSON.stringify(input), encoding: 'utf8', env: { ...baseEnv, FAKE_REVIEW: '- missing rollback', CODEX_HOME: tmp },
+    })
+    assert.equal(JSON.parse(r.stdout).decision, 'block', r.stderr)
+    assert.match(lastCall().prompt, /# Sentiment plan\n1\. Preserve research/)
+    assert.doesNotMatch(lastCall().prompt, /Old plan/)
+  }
+  // Every decision is in the bridge transcript for `cc-bridge log`.
+  const logged = fs.readFileSync(path.join(tmp, 'data', 'transcript.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
+  assert.ok(logged.some(e => e.event === 'plan_review' && e.author === 'codex' && e.reviewer === 'claude' && e.outcome === 'sent back to revise'))
 })
 
 test('CC_BRIDGE_PLAN_REVIEW=0 disables both hooks', () => {

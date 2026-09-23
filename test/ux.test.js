@@ -12,6 +12,7 @@ import { transition } from '../lib/lifecycle.js'
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
 process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
 process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
+process.env.CC_BRIDGE_CLAUDE_PROC = 'none' // isolate from the Claude session running the tests
 fs.mkdirSync(process.env.CC_BRIDGE_DATA_DIR, { mode: 0o700 })
 const fake = path.join(tmp, 'fake-agent')
 const config = path.join(tmp, 'config.json')

@@ -75,7 +75,13 @@ switch (cmd) {
     const events = readTranscript()
     const status = new Map()
     for (const e of events) if (e.event !== 'sent') status.set(e.msg_id, e.event + (e.error ? ` (${e.error})` : ''))
-    for (const e of events.filter(e => e.event === 'sent').slice(-n)) {
+    for (const e of events.filter(e => e.event === 'sent' || e.event === 'plan_review').slice(-n)) {
+      if (e.event === 'plan_review') {
+        console.log(`${e.ts}  plan review  ${e.author}'s plan, reviewed by ${e.reviewer}  [${e.outcome}]  ${e.cwd}`)
+        if (e.review) console.log(`  ${e.review.replace(/\n/g, '\n  ')}`)
+        console.log()
+        continue
+      }
       console.log(`${e.ts}  ${e.kind}  ${e.from} → ${e.to}  [${status.get(e.msg_id) || 'pending'}]`)
       console.log(`  msg_id=${e.msg_id}${e.reply_to ? `  in_reply_to=${e.reply_to}` : ''}`)
       console.log(`  ${e.text.replace(/\n/g, '\n  ')}\n`)
