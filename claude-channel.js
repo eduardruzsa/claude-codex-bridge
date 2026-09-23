@@ -16,11 +16,9 @@ import {
   claudeParty,
   codexParty,
   loadPairs,
-  newId,
   pairLive,
   parseParty,
   paths,
-  readTranscript,
   record,
   validLabel,
   validateReply,
@@ -29,9 +27,13 @@ import {
 import { deliverToCodex } from './lib/deliver.js'
 import { identity } from './lib/lifecycle.js'
 import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor, sweepLifecycleDirs } from './lib/claude-process.js'
+import { bindPending, beginHandover, releaseClaim } from './lib/pending.js'
+import { messages, formatMessages } from './lib/messages.js'
+import { listSessions, formatSessions } from './lib/discovery.js'
+import { acceptLaunch, callerLaunch } from './lib/launch-state.js'
 import { loadConfig } from './lib/config.js'
 import { version } from './lib/version.js'
-import { RESUME_PROMPT, addPending, startTimeoutMs, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
+import { RESUME_PROMPT, addPending, bootstrapPrompt, codexThreadRunning, launchCodex, claimPending, finishPending } from './lib/launch.js'
 
 // A broken config file must not stop the server: it starts, reports the error on
 // every tool call, and does not listen.
@@ -148,7 +150,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: active ? TOO
 // send_to_codex, starting or reopening Codex when needed. Serialized so two quick
 // sends can't open two Codex windows.
 let sendChain = Promise.resolve()
-const resuming = new Map() // Codex thread → when we opened a terminal to resume it
 function sendNewToCodex(body) {
   const run = sendChain.then(() => sendNew(body))
   sendChain = run.catch(() => {})
@@ -164,26 +165,25 @@ async function sendNew(body) {
     if (codexThreadRunning(pair.codex)) return sendToPairedCodex(body, null, 'message')
     const res = await deliverToCodex({ fromLabel: label, claudeSession: mySession, thread: pair.codex, text: body, kind: 'message' })
     if (res.status !== 'queued') return fail(`not delivered to Codex thread ${pair.codex}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
-    // Codex takes a while to open its rollout; don't open a second terminal meanwhile.
-    const opening = Date.now() - (resuming.get(pair.codex) || 0) < startTimeoutMs()
-    if (!opening) {
-      await launchCodex(cwd, ['resume', pair.codex, RESUME_PROMPT])
-      resuming.set(pair.codex, Date.now())
-    }
+    let started
+    try { started = await launchCodex(cwd, ['resume', pair.codex, RESUME_PROMPT], label, mySession, pair.codex) }
+    catch (err) { return text(`Message queued (msg_id ${res.msg_id}), but the window could not open: ${err.message}. Run: cc-bridge retry ${res.msg_id}. Do not send the message again.`) }
+    if (['failed', 'exited'].includes(started.launch.state)) return text(`Message queued (msg_id ${res.msg_id}); startup needs recovery. Run: cc-bridge retry ${res.msg_id}`)
+    const opening = !started.fresh
     return text(`Codex thread ${pair.codex} wasn't running, so it ${opening ? 'is already reopening' : 'was reopened in a new terminal'} in ${cwd}. ` +
       `Message queued (msg_id ${res.msg_id}); the answer arrives later as a channel event.`)
   }
-  const { launch, stale } = addPending('codex', label, { claude_session: mySession, cwd }, body)
-  if (!launch) return text('A Codex session is already starting for this conversation; the message will be delivered when it connects.')
+  const { stale, msg_id, batch_id } = await addPending('codex', label, { claude_session: mySession, cwd }, body)
   try {
-    await launchCodex(cwd, [bootstrapPrompt(label, cwd)])
+    const started = await launchCodex(cwd, [bootstrapPrompt(label, cwd)], label, mySession, null, false, batch_id)
+    if (!started.fresh) return text(`A Codex session is already starting or awaiting recovery; request ${msg_id} is preserved. ${['failed', 'exited'].includes(started.launch.state) ? `Run: cc-bridge retry ${msg_id}` : 'Check cc-bridge status.'}`)
   } catch (err) {
-    takePending('codex', label)
-    return fail(`${err.message}. Start Codex yourself in ${cwd} and ask it to connect_claude with session "${label}".`)
+    // Preserve the request if opening the terminal fails.
+    return fail(`${err.message}. Request ${msg_id} is preserved. Run: cc-bridge retry ${msg_id}`)
   }
   return text(`No Codex session was ${pair ? 'paired with this conversation' : 'running for this session'}; started a new Codex session in a terminal in ${cwd}` +
-    (stale ? ' (an earlier start never connected)' : '') +
-    `. Your message is delivered once it connects${pair ? `, replacing the pairing with thread ${pair.codex}` : ''}; approve its cc-bridge tool calls there. The answer arrives later as a channel event.`)
+    (stale ? ' (the previous conversation changed)' : '') +
+    `. Request ${msg_id} is handed over once it connects${pair ? `, replacing the pairing with thread ${pair.codex}` : ''}; approve its cc-bridge tool calls there. The answer arrives later as a channel event.`)
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
@@ -202,22 +202,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return await sendToPairedCodex(String(args.text || ''), original.msg_id, 'reply')
       }
       case 'bridge_status': {
-        const mySession = currentIdentity().ready ? currentIdentity().session : 'transitioning/unavailable'
-        const recent = readTranscript()
-          .filter(e => e.event === 'sent' && (e.from === me || e.to === me))
-          .slice(-10)
-          .map(e => `${e.ts} ${e.kind} ${e.from} → ${e.to} msg_id=${e.msg_id}${e.reply_to ? ` in_reply_to=${e.reply_to}` : ''}`)
-        return text([
-          `label: ${label} (${listening ? 'listening' : `NOT listening: ${listenError}`})`,
-          `this conversation: ${mySession}`,
-          `pairing: ${(() => {
-            const p = loadPairs()[label]
-            if (!p) return 'none'
-            return p.claude_session === mySession ? `Codex thread ${p.codex}` : `belongs to another conversation (${p.claude_session}); re-pair`
-          })()}`,
-          'recent:',
-          ...(recent.length ? recent : ['  (none)']),
-        ].join('\n'))
+        return text(`label: ${label} (${listening ? 'listening' : `NOT listening: ${listenError}`})\n` +
+          formatSessions((await listSessions()).filter(s => s.label === label)) + '\n\n' +
+          formatMessages(messages().filter(m => m.from === me || m.to === me).slice(-10)))
       }
       default:
         return fail(`unknown tool: ${req.params.name}`)
@@ -254,56 +241,60 @@ async function handleRequest(req) {
     claimed.delete(req.msg_id)
     throw err
   }
-  record({ event: 'delivered', msg_id: req.msg_id })
+  record({ event: 'notification_sent', msg_id: req.msg_id })
   return { status: 'delivered' }
 }
 
 // Messages Codex left while it was starting or reopening this Claude conversation.
 // A new conversation (claude_session null) first pairs with that Codex thread.
 async function adoptPendingFromCodex() {
-  const pending = readPending('claude', label)
-  if (!pending) return true
   const state = currentIdentity()
-  if (!state.ready || !state.session) return false // wait for SessionStart
-  takePending('claude', label)
-  if (pending.claude_session && pending.claude_session !== state.session) {
-    record({ event: 'dropped', label, reason: `pending messages were for Claude conversation ${pending.claude_session}` })
-    return true
+  if (!state.ready || !state.session) return
+  const provenance = callerLaunch('claude')
+  if (provenance && !provenance.connected) await acceptLaunch('claude', label, state.session)
+  for (;;) {
+    const pending = await claimPending('claude', label)
+    if (!pending) return
+    const m = pending.message
+    try {
+      if (pending.claude_session && pending.claude_session !== state.session) {
+        await finishPending('claude', label, m.msg_id, 'dropped', 'Claude conversation changed', m.claim_id)
+        continue
+      }
+      await acceptLaunch('claude', label, state.session)
+      if (!pending.claude_session && loadPairs()[label]?.claude_session !== state.session) await pairLive(label, pending.codex)
+      const pair = loadPairs()[label]
+      if (pair?.codex !== pending.codex || pair.claude_session !== state.session) {
+        await finishPending('claude', label, m.msg_id, 'dropped', 'Pairing changed before handover', m.claim_id)
+        continue
+      }
+      await bindPending('claude', label, m.msg_id, state.session, m.claim_id)
+      await beginHandover('claude', label, m.msg_id, m.claim_id)
+      const msg = { msg_id: m.msg_id, created_at: m.created_at, from: codexParty(pending.codex), to: me, claude_session: state.session, reply_to: null, kind: 'message', text: m.text }
+      record({ event: 'sent', ...msg })
+      claimed.add(msg.msg_id)
+      await pushToClaude(msg)
+      await finishPending('claude', label, m.msg_id, 'notification_sent', 'Receipt unconfirmed until a reply', m.claim_id)
+    } catch (err) {
+      await releaseClaim('claude', label, m.msg_id, m.claim_id, err.message)
+      throw err
+    }
   }
-  if (!pending.claude_session) await pairLive(label, pending.codex)
-  const pair = loadPairs()[label]
-  if (pair?.codex !== pending.codex || pair.claude_session !== state.session) {
-    record({ event: 'dropped', label, reason: 'pairing changed before pending messages were delivered' })
-    return true
-  }
-  for (const m of pending.messages) {
-    const msg = { msg_id: newId(), from: codexParty(pending.codex), to: me, claude_session: state.session, reply_to: null, kind: 'message', text: m.text }
-    record({ event: 'sent', ...msg })
-    claimed.add(msg.msg_id)
-    await pushToClaude(msg)
-    record({ event: 'delivered', msg_id: msg.msg_id })
-  }
-  return true
 }
 
 function watchPendingFromCodex() {
-  const deadline = Date.now() + 2 * 60 * 1000
-  let busy = false
-  const tick = async () => {
-    if (busy) return
+  let busy = false, failures = 0, nextAttempt = 0
+  const timer = setInterval(async () => {
+    if (busy || Date.now() < nextAttempt) return
     busy = true
-    try {
-      if ((await adoptPendingFromCodex()) || Date.now() > deadline) clearInterval(timer)
-    } catch (err) {
-      console.error(`cc-bridge: pending delivery failed: ${err.message}`)
-      clearInterval(timer)
-    } finally {
-      busy = false
-    }
-  }
-  const timer = setInterval(tick, 500)
+    try { await adoptPendingFromCodex(); failures = 0 }
+    catch (err) {
+      failures++
+      nextAttempt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(failures, 6))
+      console.error(`cc-bridge: pending handover delayed: ${err.message}`)
+    } finally { busy = false }
+  }, 500)
   timer.unref()
-  tick()
 }
 
 function pushToClaude(req) {

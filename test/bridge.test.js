@@ -59,18 +59,23 @@ process.stdin.on('data', d => (input += d)).on('end', () => {
 `, { mode: 0o755 })
 
 fs.writeFileSync(env.CC_BRIDGE_TERMINAL, `#!/usr/bin/env node
+const args = process.argv.slice(2)
+const fs = require('fs')
+const argv = args[1]?.endsWith('/agent-launch.js') ? JSON.parse(fs.readFileSync(require('path').join(process.env.CC_BRIDGE_DATA_DIR, 'launches', args[2] + '.json'))).argv : args
 const agentVars = Object.keys(process.env).filter(k => /^(CLAUDE|CODEX|CC_BRIDGE_(LABEL|LIFECYCLE_DIR)$)/.test(k)).sort()
-require('fs').appendFileSync(${JSON.stringify(path.join(tmp, 'terminal.log'))}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), agentVars }) + '\\n')
+require('fs').appendFileSync(${JSON.stringify(path.join(tmp, 'terminal.log'))}, JSON.stringify({ argv, cwd: process.cwd(), agentVars }) + '\\n')
 `, { mode: 0o755 })
 const launched = () => {
   const f = path.join(tmp, 'terminal.log')
   return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map(JSON.parse) : []
 }
 
-const { labelMutexName, pairLive } = await import('../lib/common.js')
+const { labelMutexName, pairLive, unpair } = await import('../lib/common.js')
 
+const activeClients = new Set()
 async function connect(command, args, extraEnv) {
   const client = new Client({ name: 'test', version: '0' })
+  activeClients.add(client)
   const notifications = []
   client.fallbackNotificationHandler = async n => notifications.push(n)
   await client.connect(new StdioClientTransport({ command, args, env: { ...env, ...extraEnv } }))
@@ -116,6 +121,7 @@ before(async () => {
   await pairLive('t1', THREAD)
 })
 after(async () => {
+  for (const client of activeClients) await client.close()
   await claude?.client.close()
   await codex?.client.close()
   fs.rmSync(tmp, { recursive: true, force: true })
@@ -124,7 +130,7 @@ after(async () => {
 test('Codex → Claude → Codex, with follow-up', async () => {
   const sent = await codex.call('send_to_claude', { text: 'Is the plan sound?', as_thread: THREAD })
   assert.ok(sent.ok, sent.text)
-  assert.match(sent.text, /^delivered/)
+  assert.match(sent.text, /^notification sent.*Receipt unconfirmed/)
 
   const n = await waitFor(() => claude.notifications.filter(channel).at(-1))
   assert.equal(n.params.content, 'Is the plan sound?')
@@ -251,11 +257,11 @@ test('Codex identity comes from the host _meta, is checked against the process, 
   const own = await codex.call('send_to_claude', { text: 'real', as_thread: THREAD })
   assert.ok(own.ok, own.text)
   assert.match((await waitFor(() => claude.notifications.filter(channel)[before])).params.meta.from, new RegExp(THREAD))
-  assert.match((await codex.call('bridge_status', { as_thread: THREAD })).text, new RegExp(`this thread: ${THREAD}`))
+  assert.match((await codex.call('bridge_status', { as_thread: THREAD })).text, /t1: paired/)
 
   // Codex may send the turn metadata as a JSON string instead of an object.
   const asString = await codex.call('bridge_status', { raw_meta: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: THREAD }) } })
-  assert.match(asString.text, new RegExp(`this thread: ${THREAD}`))
+  assert.match(asString.text, /t1: paired/)
 
   const none = await startCodex([])
   const n = await none.call('send_to_claude', { text: 'x', session: 't1', as_thread: THREAD })
@@ -314,7 +320,7 @@ test('a new Claude conversation reusing a label does not inherit the pairing', a
   assert.match(fromB.text, /started a new Codex session.*replacing the pairing with thread 4444/)
 
   const s = await codex.call('bridge_status', { as_thread: T4 })
-  assert.match(s.text, /claude "t4" \(conversation conv-A\) ⇄ codex 4444.*session changed \(now conv-B; re-pair\)/)
+  assert.match(s.text, /t4: conversation-changed/)
 
   await pairLive('t4', T4) // explicit re-pair adopts conversation B
   assert.ok((await codex.call('send_to_claude', { text: 'to B', as_thread: T4 })).ok)
@@ -407,7 +413,7 @@ test('Codex reopens its paired Claude conversation when it is not running', asyn
   await pairLive('t3', T3)
   await gone.client.close()
   await waitFor(() => !fs.existsSync(sockFile('t3')))
-  assert.match((await codex.call('bridge_status', { as_thread: T3 })).text, /claude "t3" .*: disconnected/)
+  assert.match((await codex.call('bridge_status', { as_thread: T3 })).text, /t3: disconnected/)
 
   const launches = launched().length
   const r = await codex.call('send_to_claude', { text: 'hello again', as_thread: T3 })
@@ -577,4 +583,79 @@ test('private permissions on data and runtime', () => {
   assert.equal(mode(path.join(env.CC_BRIDGE_DATA_DIR, 'token')), 0o600)
   assert.equal(mode(path.join(env.CC_BRIDGE_DATA_DIR, 'pairs.json')), 0o600)
   assert.equal(mode(sockFile('t1')), 0o600)
+})
+
+
+test('pair_with_claude hands over bootstrap requests with their original IDs', async () => {
+  const t = 'c2c2c2c2-2222-3333-4444-555555555555'
+  const source = await startClaude('compat-bootstrap', 'compat-conversation')
+  await waitFor(() => fs.existsSync(sockFile('compat-bootstrap')))
+  const sent = await source.call('send_to_codex', { text: 'compatibility handover' })
+  assert.ok(sent.ok, sent.text)
+  const id = sent.text.match(/Request ([0-9a-f-]{36})/)[1]
+  const receiver = await startCodex([t])
+  const result = await receiver.call('pair_with_claude', { session: 'compat-bootstrap', as_thread: t })
+  assert.ok(result.ok, result.text)
+  assert.match(result.text, /compatibility handover/)
+  assert.equal(msgIdFrom(result.text), id)
+  const second = await receiver.call('connect_claude', { session: 'compat-bootstrap', project_dir: tmp, as_thread: t })
+  assert.doesNotMatch(second.text, /compatibility handover/)
+  await source.client.close(); await receiver.client.close()
+})
+
+
+test('a second fresh bootstrap after unpair does not inherit the old destination', async () => {
+  const source = await startClaude('bootstrap-twice', 'same-conversation')
+  await waitFor(() => fs.existsSync(sockFile('bootstrap-twice')))
+  const t1 = 'e1e1e1e1-2222-3333-4444-555555555555'
+  const t2 = 'e2e2e2e2-2222-3333-4444-555555555555'
+  const receiver = await startCodex([t1, t2])
+  assert.ok((await source.call('send_to_codex', { text: 'first bootstrap' })).ok)
+  assert.match((await receiver.call('connect_claude', { project_dir: tmp, session: 'bootstrap-twice', as_thread: t1 })).text, /first bootstrap/)
+  await unpair('bootstrap-twice')
+  assert.ok((await source.call('send_to_codex', { text: 'second bootstrap' })).ok)
+  const result = await receiver.call('connect_claude', { project_dir: tmp, session: 'bootstrap-twice', as_thread: t2 })
+  assert.ok(result.ok, result.text)
+  assert.match(result.text, /second bootstrap/)
+  assert.doesNotMatch(result.text, /first bootstrap/)
+  await source.client.close(); await receiver.client.close()
+})
+
+test('a channel without launch ownership preserves pending requests instead of draining them', async () => {
+  const { addPending, readPending } = await import('../lib/pending.js')
+  const { reserveLaunch, updateLaunch } = await import('../lib/launch-state.js')
+  const { processIdentity } = await import('../lib/store.js')
+  const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+  await new Promise(r => owner.once('spawn', r))
+  let channelServer
+  try {
+    await addPending('claude', 'wrong-owner', { codex: THREAD, claude_session: null, cwd: tmp }, 'keep waiting')
+    const attempt = await reserveLaunch({ kind: 'claude', label: 'wrong-owner', codex: THREAD, claude_session: null, cwd: tmp, argv: ['false'] })
+    await updateLaunch(attempt.launch.id, { state: 'running', owner: processIdentity(owner.pid) })
+    channelServer = await startClaude('wrong-owner', 'manual-conversation')
+    await waitFor(() => fs.existsSync(sockFile('wrong-owner')))
+    await new Promise(r => setTimeout(r, 800))
+    assert.equal(readPending('claude', 'wrong-owner').messages[0].state, 'pending')
+    assert.equal(channelServer.notifications.filter(channel).length, 0)
+  } finally { owner.kill(); await channelServer?.client.close() }
+})
+
+
+test('retry hands a leftover pending request to a live paired Codex without opening a window', async () => {
+  const { addPending, readPending } = await import('../lib/pending.js')
+  const { retryMessage } = await import('../lib/recovery.js')
+  const t = 'f3f3f3f3-2222-3333-4444-555555555555'
+  const source = await startClaude('leftover', 'leftover-conversation')
+  const receiver = await startCodex([t])
+  await waitFor(() => fs.existsSync(sockFile('leftover')))
+  await pairLive('leftover', t)
+  const request = await addPending('codex', 'leftover', { claude_session: 'leftover-conversation', cwd: tmp }, 'leftover request')
+  const launches = launched().length
+  const before = queued().length
+  assert.match(await retryMessage(request.msg_id), /existing Codex conversation; no new window/)
+  assert.equal(launched().length, launches)
+  const q = await waitFor(() => queued()[before])
+  assert.match(q[4], new RegExp(request.msg_id))
+  assert.equal(readPending('codex', 'leftover').messages[0].state, 'queued')
+  await source.client.close(); await receiver.client.close()
 })
