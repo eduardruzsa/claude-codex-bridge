@@ -6,7 +6,8 @@ import {
   readTranscript,
   unpair,
 } from '../lib/common.js'
-import { install, doctor } from '../lib/admin.js'
+import { install, doctor, uninstall } from '../lib/admin.js'
+import { SCHEMA, configPath, initConfig, loadConfig, setConfig } from '../lib/config.js'
 import { listSessions, formatSessions } from '../lib/discovery.js'
 
 const [cmd, ...rest] = process.argv.slice(2)
@@ -17,6 +18,8 @@ const flag = name => {
 
 const usage = `usage:
   cc-bridge install
+  cc-bridge uninstall [--purge]
+  cc-bridge config [init | get <key> | set <key> <value>]
   cc-bridge doctor
   cc-bridge sessions
   cc-bridge pair --claude <label> --codex <thread-uuid>
@@ -28,6 +31,39 @@ switch (cmd) {
   case 'install':
     try { console.log(install()) } catch (e) { console.error(e.message); process.exitCode = 1 }
     break
+  case 'uninstall': {
+    const { done, skipped } = uninstall({ purge: rest.includes('--purge') })
+    for (const d of done) console.log(d)
+    for (const s of skipped) console.log(`skipped: ${s}`)
+    console.log('Restart Codex and any running Claude sessions to finish.')
+    break
+  }
+  case 'config': {
+    const [sub, key, value] = rest
+    try {
+      if (sub === 'init') {
+        console.log(initConfig() ? `wrote defaults to ${configPath()}` : `${configPath()} already exists; not changed`)
+      } else if (sub === 'get' && key in SCHEMA) {
+        console.log(JSON.stringify(loadConfig().values[key]))
+      } else if (sub === 'set' && key && value !== undefined) {
+        console.log(`${key} = ${JSON.stringify(setConfig(key, value))} in ${configPath()}`)
+        if (key === 'plan_review.review_codex_plans') console.log('Run cc-bridge install to add or remove the Codex plan-review hook.')
+        console.log('Running agents pick most changes up on their next action; restart them for claude_bin, data_dir or runtime_dir.')
+      } else if (!sub) {
+        const { file, exists, values, sources, warnings } = loadConfig()
+        console.log(`config: ${file}${exists ? '' : ' (not created; run cc-bridge config init)'}`)
+        for (const [k, spec] of Object.entries(SCHEMA)) {
+          console.log(`  ${k} = ${JSON.stringify(values[k])}  [${sources[k]}]`)
+          console.log(`      ${spec.doc}${spec.env ? `; env ${spec.env}` : ''}`)
+        }
+        for (const w of warnings) console.log(`warning: ${w}`)
+      } else {
+        console.error(usage)
+        process.exitCode = 2
+      }
+    } catch (e) { console.error(e.message); process.exitCode = 1 }
+    break
+  }
   case 'doctor': {
     const checks = await doctor()
     for (const c of checks) console.log(`${c.ok ? 'OK' : 'FAIL'} ${c.name}${c.ok ? '' : ` — ${c.fix}`}`)

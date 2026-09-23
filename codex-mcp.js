@@ -32,10 +32,11 @@ import {
 } from './lib/common.js'
 import { deliverToClaude } from './lib/deliver.js'
 import { connectClaude, listSessions, formatSessions } from './lib/discovery.js'
-import { START_TIMEOUT_MS, addPending, launchClaude, readPending, takePending } from './lib/launch.js'
+import { addPending, launchClaude, readPending, startTimeoutMs, takePending } from './lib/launch.js'
+import { config } from './lib/config.js'
+import { version } from './lib/version.js'
 
-const CONSULT_TIMEOUT_MS = 10 * 60 * 1000
-const claudeBin = () => process.env.CC_BRIDGE_CLAUDE_BIN || 'claude'
+const claudeBin = () => config().claude_bin
 
 const TOOLS = [
   {
@@ -217,11 +218,11 @@ async function freshLabel(thread) {
   const candidates = [base, ...Array.from({ length: 50 }, (_, i) => `${base}-${i + 2}`)]
   for (const label of candidates) {
     const pending = readPending('claude', label)
-    if (pending && pending.codex === thread && pending.claude_session === null && Date.now() - pending.started_at < START_TIMEOUT_MS) return label
+    if (pending && pending.codex === thread && pending.claude_session === null && Date.now() - pending.started_at < startTimeoutMs()) return label
   }
   for (const label of candidates) {
     const pending = readPending('claude', label)
-    if (loadPairs()[label] || (pending && Date.now() - pending.started_at < START_TIMEOUT_MS)) continue
+    if (loadPairs()[label] || (pending && Date.now() - pending.started_at < startTimeoutMs())) continue
     if ((await sendToClaudeSocket(label, { op: 'ping' }, 1000)).status !== 'disconnected') continue
     return label
   }
@@ -294,7 +295,7 @@ function consult(args) {
     const child = spawn(claudeBin(), cliArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
     let out = ''
     let err = ''
-    const timer = setTimeout(() => child.kill('SIGTERM'), CONSULT_TIMEOUT_MS)
+    const timer = setTimeout(() => child.kill('SIGTERM'), config().consult_timeout_seconds * 1000)
     child.stdout.on('data', d => (out += d))
     child.stderr.on('data', d => (err += d))
     child.on('error', e => {
@@ -328,7 +329,7 @@ function consult(args) {
 }
 
 const mcp = new Server(
-  { name: 'cc-bridge', version: '0.1.0' },
+  { name: 'cc-bridge', version },
   {
     capabilities: { tools: {} },
     instructions:

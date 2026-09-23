@@ -6,13 +6,18 @@ import { spawnSync, execFileSync } from 'node:child_process'
 import { after, test } from 'node:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { install, minimumNode, supportedNode, root, shQuote } from '../lib/admin.js'
+import { install, minimumNode, supportedNode, root, shQuote, uninstall } from '../lib/admin.js'
 import { transition } from '../lib/lifecycle.js'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
 process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
 process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
 process.env.CC_BRIDGE_CLAUDE_PROC = 'none' // isolate from the Claude session running the tests
+process.env.CC_BRIDGE_CONFIG = path.join(tmp, 'cc-bridge.json') // never the user's config
+delete process.env.CODEX_HOME // hooks.json must come from the test home
+const terminal = path.join(tmp, 'fake-terminal') // CI has no xdg-terminal-exec
+fs.writeFileSync(terminal, '#!/bin/sh\n', { mode: 0o755 })
+process.env.CC_BRIDGE_TERMINAL = terminal
 fs.mkdirSync(process.env.CC_BRIDGE_DATA_DIR, { mode: 0o700 })
 const fake = path.join(tmp, 'fake-agent')
 const config = path.join(tmp, 'config.json')
@@ -23,6 +28,7 @@ if(a[0]==='mcp') {
  const c=JSON.parse(fs.readFileSync(p));
  if(a[1]==='get') {if(!c[a[2]]){console.error('No MCP server named '+a[2]);process.exit(1)}console.log(JSON.stringify(c[a[2]]))}
  if(a[1]==='add') {c[a[2]]={enabled:true,transport:{command:a[4],args:a.slice(5)}};fs.writeFileSync(p,JSON.stringify(c))}
+ if(a[1]==='remove') {delete c[a[2]];fs.writeFileSync(p,JSON.stringify(c))}
 } else console.log('--thread --message --restricted Claude Code 2.1.280');
 `, { mode: 0o755 })
 process.env.CC_BRIDGE_CODEX_BIN = fake
@@ -37,12 +43,15 @@ after(async () => {
   fs.rmSync(tmp, { recursive: true, force: true })
 })
 
-async function channel(label, cwd, lifecycle) {
+// `explicit: false` starts it without CC_BRIDGE_LABEL (label chosen by the channel);
+// `label` is then the label it is expected to end up with.
+async function channel(label, cwd, lifecycle, { explicit = true, session = `${label}-session` } = {}) {
   const client = new Client({ name: 'ux-test', version: '1' })
   const notifications = []
   client.fallbackNotificationHandler = async n => notifications.push(n)
   clients.add(client)
-  const env = { ...process.env, CC_BRIDGE_LABEL: label, CLAUDE_CODE_SESSION_ID: `${label}-session`, CC_BRIDGE_ACTIVE: '1' }
+  const env = { ...process.env, CC_BRIDGE_LABEL: label, CLAUDE_CODE_SESSION_ID: session, CC_BRIDGE_ACTIVE: '1' }
+  if (!explicit) delete env.CC_BRIDGE_LABEL
   delete env.CC_BRIDGE_LIFECYCLE_DIR
   if (lifecycle) env.CC_BRIDGE_LIFECYCLE_DIR = lifecycle
   await client.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'claude-channel.js')], cwd, env }))
@@ -66,6 +75,7 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   const hooksFile = path.join(home, '.codex', 'hooks.json')
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
   install({ home })
   const first = fs.readFileSync(config, 'utf8')
   install({ home })
@@ -81,6 +91,10 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   fs.writeFileSync(hooksFile, JSON.stringify(legacy))
   install({ home })
   assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks).length, 2)
+  // Turning Codex plan review off and reinstalling removes only our hook.
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: false } }))
+  install({ home })
+  assert.deepEqual(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command)), ['keep-me'])
   assert.equal(JSON.parse(first).other.command, 'preserve-me')
   assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
   const conflictingHome = path.join(tmp, 'conflict')
@@ -95,6 +109,43 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   fs.writeFileSync(config, first)
   assert.ok(supportedNode(minimumNode))
   assert.ok(!supportedNode('22.23.1'))
+})
+
+test('uninstall removes only what is ours; --purge spares unrelated files', () => {
+  const home = path.join(tmp, 'uninstall-home')
+  const hooksFile = path.join(home, '.codex', 'hooks.json')
+  fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
+  fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
+  install({ home })
+  const data = process.env.CC_BRIDGE_DATA_DIR
+  fs.writeFileSync(path.join(data, 'token'), 'x')
+  fs.writeFileSync(path.join(data, 'mine.txt'), 'not the bridge\'s')
+  fs.writeFileSync(path.join(data, 'notes.1.tmp'), 'not the bridge\'s either')
+  fs.mkdirSync(path.join(data, 'plan-review'), { recursive: true })
+  fs.writeFileSync(path.join(data, 'plan-review', 'my-plan.md'), 'a foreign file in a bridge-named directory')
+  fs.mkdirSync(path.join(data, 'pending-codex'), { recursive: true })
+  fs.writeFileSync(path.join(data, 'pending-codex', 'claude.json'), '{}')
+
+  const kept = uninstall({ home })
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8'))['cc-bridge'], undefined, 'MCP registration removed')
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8')).other.command, 'preserve-me')
+  assert.deepEqual(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command)), ['keep-me'])
+  assert.equal(fs.existsSync(path.join(home, '.local/bin/claude-live')), false)
+  assert.ok(fs.existsSync(path.join(data, 'token')), 'data kept without --purge')
+  assert.match(kept.done.join('\n'), /use --purge/)
+
+  // A foreign file where our link would be is left alone.
+  fs.writeFileSync(path.join(home, '.local/bin/cc-bridge'), 'valuable')
+  const purged = uninstall({ home, purge: true })
+  assert.equal(fs.readFileSync(path.join(home, '.local/bin/cc-bridge'), 'utf8'), 'valuable')
+  assert.match(purged.skipped.join('\n'), /not our link/)
+  assert.ok(!fs.existsSync(path.join(data, 'token')))
+  assert.equal(fs.readFileSync(path.join(data, 'mine.txt'), 'utf8'), 'not the bridge\'s')
+  assert.ok(fs.existsSync(path.join(data, 'notes.1.tmp')))
+  assert.ok(fs.existsSync(path.join(data, 'plan-review', 'my-plan.md')), 'directory with a foreign file kept')
+  assert.ok(!fs.existsSync(path.join(data, 'pending-codex')), 'bridge-only directory removed')
+  assert.ok(!fs.existsSync(process.env.CC_BRIDGE_CONFIG))
 })
 
 test('claude-live enables the plugin channel and forwards arguments', () => {
@@ -166,6 +217,48 @@ test('discovery auto-connects only one eligible same-project conversation', asyn
   await assert.rejects(connectClaude(T, cwd), /Existing pairing.*not switching/)
   await unpair('discover-b'); await close(a)
 })
+
+test('a second claude-live gets the next free label; an explicit label is never replaced', async () => {
+  const cwd = path.join(tmp, 'labels'); fs.mkdirSync(cwd)
+  const status = async c => (await c.client.callTool({ name: 'bridge_status', arguments: {} })).content[0].text
+  const first = await channel('claude', cwd, null, { explicit: false, session: 'first' })
+  const second = await channel('claude-2', cwd, null, { explicit: false, session: 'second' })
+  assert.match(await status(second), /^label: claude-2 \(listening\)/)
+
+  // Explicit and taken: refused, with the reason on every tool call.
+  const dup = new Client({ name: 'ux-test', version: '1' }); clients.add(dup)
+  await dup.connect(new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'claude-channel.js')], cwd,
+    env: { ...process.env, CC_BRIDGE_LABEL: 'claude', CLAUDE_CODE_SESSION_ID: 'third', CC_BRIDGE_ACTIVE: '1' } }))
+  await waitForText(async () => (await dup.callTool({ name: 'bridge_status', arguments: {} })).content[0].text, /NOT listening: another live Claude session already uses label "claude"; set CC_BRIDGE_LABEL/)
+  await dup.close(); clients.delete(dup)
+
+  // A resumed conversation takes back the label it is paired under.
+  const pairsFile = path.join(process.env.CC_BRIDGE_DATA_DIR, 'pairs.json')
+  const saved = fs.existsSync(pairsFile) ? fs.readFileSync(pairsFile, 'utf8') : null
+  fs.writeFileSync(pairsFile, JSON.stringify({ 'claude-7': { codex: T, claude_session: 'resumed', cwd } }), { mode: 0o600 })
+  const resumed = await channel('claude-7', cwd, null, { explicit: false, session: 'resumed' })
+  assert.match(await status(resumed), /label: claude-7 \(listening\)[\s\S]*pairing: Codex thread 11111111/)
+
+  // Lifecycle identity decides, not a stale CLAUDE_CODE_SESSION_ID, even when
+  // SessionStart arrives after the channel started.
+  fs.writeFileSync(pairsFile, JSON.stringify({ 'claude-8': { codex: U, claude_session: 'lifecycle-resumed', cwd } }), { mode: 0o600 })
+  const dir = path.join(tmp, 'late-lifecycle'); fs.mkdirSync(dir, { mode: 0o700 })
+  setTimeout(() => hook(dir, 'lifecycle-resumed', 'SessionStart', 'resume', cwd), 400)
+  const late = await channel('claude-8', cwd, dir, { explicit: false, session: 'stale-env-id' })
+  assert.match(await status(late), /label: claude-8 \(listening\)/)
+
+  if (saved === null) fs.rmSync(pairsFile); else fs.writeFileSync(pairsFile, saved)
+  for (const c of [late, resumed, second, first]) await close(c)
+})
+
+async function waitForText(read, pattern) {
+  const deadline = Date.now() + 3000
+  for (;;) {
+    const text = await read()
+    if (pattern.test(text) || Date.now() > deadline) return assert.match(text, pattern)
+    await new Promise(r => setTimeout(r, 50))
+  }
+}
 
 test('lifecycle rejects delayed events and allows same-conversation resume', () => {
   const start = (sid, source = 'startup') => ({ session_id: sid, hook_event_name: 'SessionStart', source, cwd: tmp })

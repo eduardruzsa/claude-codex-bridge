@@ -1,6 +1,17 @@
 {
   "name": "cc-bridge",
   "description": "Two-way Claude Code ⇄ Codex bridge: a Claude Channel that talks to Codex sessions, starting them when needed. Active only in sessions started with claude-live.",
-  "version": "0.3.2",
-  "keywords": ["codex", "channel", "mcp", "bridge"]
+  "version": "0.4.0",
+  "keywords": [
+    "codex",
+    "channel",
+    "mcp",
+    "bridge"
+  ],
+  "author": {
+    "name": "Eduard Ruzsa"
+  },
+  "homepage": "https://github.com/eduardruzsa/claude-codex-bridge",
+  "repository": "https://github.com/eduardruzsa/claude-codex-bridge",
+  "license": "MIT"
 }
