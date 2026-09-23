@@ -4,7 +4,7 @@ Ask either agent to discuss or review something with the other, without copying 
 
 ## Setup
 
-Requirements: Linux, Node **22.23.2 or newer**, Git, `flock` (util-linux), Claude Code with Channels and `--restricted`, a Claude login, and Codex with `codex queue`. Tested with Claude Code 2.1.280 and Codex 0.156.1. Linux is required for `/proc` and abstract sockets.
+Requirements: Linux, Node **22.23.2 or newer**, Git, `flock` (util-linux), `xdg-terminal-exec` (or set `CC_BRIDGE_TERMINAL`), Claude Code with Channels and `--restricted`, a Claude login, and Codex with `codex queue`. Tested with Claude Code 2.1.280 and Codex 0.156.1. Linux is required for `/proc` and abstract sockets.
 
 After cloning this repository, run from its directory:
 
@@ -12,9 +12,11 @@ After cloning this repository, run from its directory:
 npm run setup
 ```
 
-Setup installs the locked dependencies, registers `cc-bridge` in Codex, and links `claude-live` and `cc-bridge` into `~/.local/bin`. It is safe to repeat: other MCP entries are preserved, and unrelated files or conflicting registrations are never overwritten. Keep the repository at its installed path. Put `~/.local/bin` on PATH if necessary.
+Setup installs the locked dependencies, registers `cc-bridge` in Codex, installs the `cc-bridge@cc-bridge` Claude plugin (this repository is its local marketplace), and links `claude-live` and `cc-bridge` into `~/.local/bin`. It is safe to repeat: other MCP entries are preserved, and unrelated files or conflicting registrations are never overwritten. Keep the repository at its installed path. Put `~/.local/bin` on PATH if necessary.
 
-Restart or reload Codex's MCP connection after installation or updates.
+Restart Codex after installation or updates. After `git pull`, run `cc-bridge install` again to update the Claude plugin.
+
+The Claude side is a plugin, and its channel loads in every Claude session. It stays dormant, with no tools and no socket, unless Claude was started with `claude-live`. Custom Channels need a startup flag, and `claude-live` is just `claude --dangerously-load-development-channels plugin:cc-bridge@cc-bridge "$@"`.
 
 ## Daily use
 
@@ -23,8 +25,15 @@ Restart or reload Codex's MCP connection after installation or updates.
    claude-live
    ```
    Accept Claude's development-channel prompt when shown. `claude-live --continue` and `claude-live --resume <id>` also work.
-2. Open Codex in the same project and say **“Ask Claude to review this.”** Codex connects automatically if exactly one unpaired Claude conversation matches. If there are several choices or a pairing would change, it asks you to select one.
-3. Either agent can now ask questions and reply. Ordinary terminal output is not forwarded; bridge tools carry the conversation.
+2. Say **“ask Codex to review this”**. You don't need to open Codex first:
+   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory. It connects and receives the message; approve its cc-bridge tool calls there.
+   - **Its paired Codex thread isn't running:** that thread is reopened (`codex resume`) and the message waits for it.
+3. It works the same the other way. In Codex, say **“ask Claude …”**:
+   - **No connection:** a *new* Claude conversation opens with `claude-live` in Codex's directory, pairs itself and receives the message. Accept the channel prompt there.
+   - **The paired Claude conversation isn't running:** it is reopened (`claude-live --resume <id>`).
+4. Either agent can now ask questions and reply. Ordinary terminal output is not forwarded; bridge tools carry the conversation.
+
+Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation instead, tell it **“Connect to Claude session <label>”** (`cc-bridge sessions` lists them).
 
 To run another Claude conversation alongside the first:
 
@@ -39,7 +48,7 @@ Matching uses the canonical Git working-tree root, or the canonical working dire
 - Resuming the **same conversation** preserves its pairing.
 - `/clear`, a new conversation, or switching to another conversation updates the channel identity. The old pairing becomes invalid. Tell Codex **“Connect to Claude session review”** (using your label) to explicitly reconnect.
 - During a transition, sends are refused rather than routed using an old identity. Delayed replies never move to a replacement conversation.
-- Launch-scoped `SessionStart`/`SessionEnd` hooks track identity. Existing hooks and supplied `--settings` are retained. If hooks are disabled by policy or settings, the channel stays unavailable; restart with hooks enabled. Ordinary `claude` runs and restricted consultations do not install these hooks.
+- The plugin's `SessionStart`/`SessionEnd` hooks track identity in a private directory for each Claude process. They do nothing in sessions without the channel. If hooks are disabled by policy or settings, the channel falls back to the conversation id Claude was started with, so it won't follow `/clear`. Restricted consultations load no plugins.
 - If an old `claude-live` instance is still running after an update, restart it with `--resume` to enable lifecycle tracking.
 
 ## Troubleshooting
