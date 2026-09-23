@@ -27,7 +27,7 @@ import {
 import { deliverToCodex } from './lib/deliver.js'
 import { identity } from './lib/lifecycle.js'
 import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor, sweepLifecycleDirs } from './lib/claude-process.js'
-import { bindPending, beginHandover, releaseClaim } from './lib/pending.js'
+import { bindPending, beginHandover, readPending, releaseClaim } from './lib/pending.js'
 import { messages, formatMessages } from './lib/messages.js'
 import { listSessions, formatSessions } from './lib/discovery.js'
 import { acceptLaunch, callerLaunch } from './lib/launch-state.js'
@@ -252,6 +252,10 @@ async function adoptPendingFromCodex() {
   if (!state.ready || !state.session) return
   const provenance = callerLaunch('claude')
   if (provenance && !provenance.connected) await acceptLaunch('claude', label, state.session)
+  if (!readPending('claude', label)?.messages.some(m => m.state === 'pending')) return
+  // Ownership before claiming: a channel that doesn't own this startup must leave the
+  // requests untouched, not claim and release them on every retry.
+  await acceptLaunch('claude', label, state.session)
   for (;;) {
     const pending = await claimPending('claude', label)
     if (!pending) return
