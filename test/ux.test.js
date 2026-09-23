@@ -6,13 +6,17 @@ import { spawnSync, execFileSync } from 'node:child_process'
 import { after, test } from 'node:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { install, minimumNode, supportedNode, root, shQuote } from '../lib/admin.js'
+import { install, minimumNode, supportedNode, root, shQuote, uninstall } from '../lib/admin.js'
 import { transition } from '../lib/lifecycle.js'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
 process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
 process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
 process.env.CC_BRIDGE_CLAUDE_PROC = 'none' // isolate from the Claude session running the tests
+process.env.CC_BRIDGE_CONFIG = path.join(tmp, 'cc-bridge.json') // never the user's config
+const terminal = path.join(tmp, 'fake-terminal') // CI has no xdg-terminal-exec
+fs.writeFileSync(terminal, '#!/bin/sh\n', { mode: 0o755 })
+process.env.CC_BRIDGE_TERMINAL = terminal
 fs.mkdirSync(process.env.CC_BRIDGE_DATA_DIR, { mode: 0o700 })
 const fake = path.join(tmp, 'fake-agent')
 const config = path.join(tmp, 'config.json')
@@ -23,6 +27,7 @@ if(a[0]==='mcp') {
  const c=JSON.parse(fs.readFileSync(p));
  if(a[1]==='get') {if(!c[a[2]]){console.error('No MCP server named '+a[2]);process.exit(1)}console.log(JSON.stringify(c[a[2]]))}
  if(a[1]==='add') {c[a[2]]={enabled:true,transport:{command:a[4],args:a.slice(5)}};fs.writeFileSync(p,JSON.stringify(c))}
+ if(a[1]==='remove') {delete c[a[2]];fs.writeFileSync(p,JSON.stringify(c))}
 } else console.log('--thread --message --restricted Claude Code 2.1.280');
 `, { mode: 0o755 })
 process.env.CC_BRIDGE_CODEX_BIN = fake
@@ -66,6 +71,7 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   const hooksFile = path.join(home, '.codex', 'hooks.json')
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
   install({ home })
   const first = fs.readFileSync(config, 'utf8')
   install({ home })
@@ -81,6 +87,10 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   fs.writeFileSync(hooksFile, JSON.stringify(legacy))
   install({ home })
   assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks).length, 2)
+  // Turning Codex plan review off and reinstalling removes only our hook.
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: false } }))
+  install({ home })
+  assert.deepEqual(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command)), ['keep-me'])
   assert.equal(JSON.parse(first).other.command, 'preserve-me')
   assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
   const conflictingHome = path.join(tmp, 'conflict')
@@ -95,6 +105,35 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   fs.writeFileSync(config, first)
   assert.ok(supportedNode(minimumNode))
   assert.ok(!supportedNode('22.23.1'))
+})
+
+test('uninstall removes only what is ours; --purge spares unrelated files', () => {
+  const home = path.join(tmp, 'uninstall-home')
+  const hooksFile = path.join(home, '.codex', 'hooks.json')
+  fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
+  fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
+  install({ home })
+  const data = process.env.CC_BRIDGE_DATA_DIR
+  fs.writeFileSync(path.join(data, 'token'), 'x')
+  fs.writeFileSync(path.join(data, 'mine.txt'), 'not the bridge\'s')
+
+  const kept = uninstall({ home })
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8'))['cc-bridge'], undefined, 'MCP registration removed')
+  assert.equal(JSON.parse(fs.readFileSync(config, 'utf8')).other.command, 'preserve-me')
+  assert.deepEqual(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command)), ['keep-me'])
+  assert.equal(fs.existsSync(path.join(home, '.local/bin/claude-live')), false)
+  assert.ok(fs.existsSync(path.join(data, 'token')), 'data kept without --purge')
+  assert.match(kept.done.join('\n'), /use --purge/)
+
+  // A foreign file where our link would be is left alone.
+  fs.writeFileSync(path.join(home, '.local/bin/cc-bridge'), 'valuable')
+  const purged = uninstall({ home, purge: true })
+  assert.equal(fs.readFileSync(path.join(home, '.local/bin/cc-bridge'), 'utf8'), 'valuable')
+  assert.match(purged.skipped.join('\n'), /not our link/)
+  assert.ok(!fs.existsSync(path.join(data, 'token')))
+  assert.equal(fs.readFileSync(path.join(data, 'mine.txt'), 'utf8'), 'not the bridge\'s')
+  assert.ok(!fs.existsSync(process.env.CC_BRIDGE_CONFIG))
 })
 
 test('claude-live enables the plugin channel and forwards arguments', () => {

@@ -1,0 +1,16 @@
+{
+  "claude_bin": "claude",
+  "codex_bin": "codex",
+  "terminal": null,
+  "default_label": "claude",
+  "data_dir": null,
+  "runtime_dir": null,
+  "plan_review": {
+    "review_claude_plans": false,
+    "review_codex_plans": false,
+    "timeout_seconds": 480
+  },
+  "start_timeout_seconds": 180,
+  "consult_timeout_seconds": 600,
+  "max_exchange_depth": 20
+}

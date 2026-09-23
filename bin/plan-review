@@ -13,13 +13,20 @@ import {
   logReview,
   planFromCodexTurn,
   markReviewedRound,
+  reviewEnabled,
   takeReviewedRound,
 } from '../lib/plan-review.js'
 
 const side = process.argv[2]
 const input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}')
 const emit = obj => process.stdout.write(JSON.stringify(obj))
-if (process.env.CC_BRIDGE_PLAN_REVIEW === '0') process.exit(0)
+try {
+  if (!reviewEnabled(side)) process.exit(0)
+} catch (err) {
+  // Never block a plan over a config problem; say so instead.
+  emit({ systemMessage: `${err.message}; plan shown unreviewed.` })
+  process.exit(0)
+}
 const cwd = input.cwd && fs.existsSync(input.cwd) ? input.cwd : process.cwd()
 
 if (side === '--claude') {

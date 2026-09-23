@@ -32,8 +32,12 @@ let input = ''; process.stdin.on('data', d => (input += d)).on('end', () => {
   console.log(JSON.stringify({ result: process.env.FAKE_REVIEW, session_id: 's', is_error: process.env.FAKE_REVIEW === 'FAIL' }))
 })`, { mode: 0o755 })
 
+// Plan review is opt-in; these tests turn it on in their own config file.
+const configFile = path.join(tmp, 'config.json')
+fs.writeFileSync(configFile, JSON.stringify({ plan_review: { review_claude_plans: true, review_codex_plans: true } }))
 const baseEnv = {
   ...process.env,
+  CC_BRIDGE_CONFIG: configFile,
   CC_BRIDGE_CODEX_BIN: path.join(tmp, 'codex'),
   CC_BRIDGE_CLAUDE_BIN: path.join(tmp, 'claude'),
   CC_BRIDGE_DATA_DIR: path.join(tmp, 'data'),
@@ -123,6 +127,43 @@ test('Codex plan mode: the plan is a separate Plan item, not in last_assistant_m
   // Every decision is in the bridge transcript for `cc-bridge log`.
   const logged = fs.readFileSync(path.join(tmp, 'data', 'transcript.jsonl'), 'utf8').trim().split('\n').map(JSON.parse)
   assert.ok(logged.some(e => e.event === 'plan_review' && e.author === 'codex' && e.reviewer === 'claude' && e.outcome === 'sent back to revise'))
+})
+
+test('plan review is off by default; CC_BRIDGE_PLAN_REVIEW=1 turns it on for a session', () => {
+  const off = path.join(tmp, 'no-config.json')
+  for (const [side, input] of [['--claude', exitPlan('s5')], ['--codex', { last_assistant_message: '<proposed_plan>x</proposed_plan>', cwd: tmp }]]) {
+    const run = extra => spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), side], {
+      input: JSON.stringify(input), encoding: 'utf8', env: { ...baseEnv, CC_BRIDGE_CONFIG: off, FAKE_REVIEW: 'LGTM', ...extra },
+    })
+    assert.equal(run().stdout, '', `${side} is not reviewed without config`)
+    assert.match(run({ CC_BRIDGE_PLAN_REVIEW: '1' }).stdout, /reviewed this plan: LGTM/)
+  }
+})
+
+test('a broken config never blocks a plan', () => {
+  const broken = path.join(tmp, 'broken.json')
+  fs.writeFileSync(broken, '{ "plan_review": ')
+  const r = spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), '--claude'], {
+    input: JSON.stringify(exitPlan('s6')), encoding: 'utf8', env: { ...baseEnv, CC_BRIDGE_CONFIG: broken },
+  })
+  assert.equal(r.status, 0)
+  assert.match(JSON.parse(r.stdout).systemMessage, /broken\.json is not valid JSON.*plan shown unreviewed/)
+})
+
+test('a reviewer that ignores SIGTERM is killed and the plan passes', () => {
+  const quick = path.join(tmp, 'quick.json')
+  fs.writeFileSync(quick, JSON.stringify({ plan_review: { review_claude_plans: true, timeout_seconds: 1 } }))
+  const stubborn = path.join(tmp, 'stubborn-codex')
+  fs.writeFileSync(stubborn, `#!/usr/bin/env node
+if (process.argv[2] === 'mcp') { console.log('[]'); process.exit(0) }
+process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`, { mode: 0o755 })
+  const started = Date.now()
+  const r = spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), '--claude'], {
+    input: JSON.stringify(exitPlan('s7')), encoding: 'utf8', env: { ...baseEnv, CC_BRIDGE_CONFIG: quick, CC_BRIDGE_CODEX_BIN: stubborn },
+  })
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(JSON.parse(r.stdout).systemMessage, /unavailable \(codex exec failed.*timed out after 1s/)
+  assert.ok(Date.now() - started < 12000, 'bounded by timeout + kill grace')
 })
 
 test('CC_BRIDGE_PLAN_REVIEW=0 disables both hooks', () => {

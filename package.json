@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-bridge",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Two-way local bridge between Claude Code (Channels) and Codex (MCP + codex queue)",
   "directories": {
     "lib": "lib",

@@ -29,9 +29,19 @@ import {
 import { deliverToCodex } from './lib/deliver.js'
 import { identity } from './lib/lifecycle.js'
 import { channelActive, findClaudeProcess, launchedWithChannel, lifecycleDirFor, sweepLifecycleDirs } from './lib/claude-process.js'
-import { RESUME_PROMPT, START_TIMEOUT_MS, addPending, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
+import { config } from './lib/config.js'
+import { version } from './lib/version.js'
+import { RESUME_PROMPT, addPending, startTimeoutMs, bootstrapPrompt, codexThreadRunning, launchCodex, readPending, takePending } from './lib/launch.js'
 
-const label = process.env.CC_BRIDGE_LABEL || 'claude'
+// A broken config file must not stop the server: it starts, reports the error on
+// every tool call, and does not listen.
+let configError = null
+let label = process.env.CC_BRIDGE_LABEL || 'claude'
+try {
+  label = config().default_label
+} catch (err) {
+  configError = err.message
+}
 if (!validLabel(label)) {
   console.error(`cc-bridge: invalid CC_BRIDGE_LABEL "${label}"`)
   process.exit(1)
@@ -60,7 +70,7 @@ let listening = false
 let listenError = null
 
 const mcp = new Server(
-  { name: 'cc-bridge', version: '0.1.0' },
+  { name: 'cc-bridge', version },
   {
     capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
     instructions: !active ? 'cc-bridge is inactive in this session. To talk with Codex, restart Claude with claude-live.' :
@@ -147,7 +157,7 @@ async function sendNew(body) {
     const res = await deliverToCodex({ fromLabel: label, claudeSession: mySession, thread: pair.codex, text: body, kind: 'message' })
     if (res.status !== 'queued') return fail(`not delivered to Codex thread ${pair.codex}: ${res.error} (msg_id ${res.msg_id}; not retried)`)
     // Codex takes a while to open its rollout; don't open a second terminal meanwhile.
-    const opening = Date.now() - (resuming.get(pair.codex) || 0) < START_TIMEOUT_MS
+    const opening = Date.now() - (resuming.get(pair.codex) || 0) < startTimeoutMs()
     if (!opening) {
       await launchCodex(cwd, ['resume', pair.codex, RESUME_PROMPT])
       resuming.set(pair.codex, Date.now())
@@ -359,6 +369,7 @@ function socketIsDead(sockPath) {
 }
 
 async function listen() {
+  if (configError) throw new Error(configError)
   if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && !pluginLifecycleDir && !currentIdentity().ready) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
   const sockPath = paths.socket(label)
   const mutex = await acquireLabel()
