@@ -1,10 +1,11 @@
-# Verification — 2026-09-23
+# Live verification
+
+Automated tests use fake agents. The steps below were checked by hand against real agents on 2026-09-23, before 0.4.0. Repeat them after changing the channel, discovery or lifecycle code.
 
 Environment: Linux, Node 22.23.2, Claude Code 2.1.280, Codex 0.156.1.
 
-- `npm test`: 25 passed, zero failures; the separate live consultation test is skipped by default.
 - `CC_BRIDGE_LIVE=1 node --test test/live.test.js`: passed against real Claude; only read/search tools loaded and the requested file write did not occur.
-- `npm run setup` completed using the lockfile. Repeating `cc-bridge install` succeeded without changing the existing registration; Serena and Context7 remained configured.
+- `npm run setup` completed using the lockfile. Repeating `cc-bridge install` succeeded without changing the existing registration; other configured MCP servers were kept.
 - `cc-bridge doctor`: all checks passed outside the execution sandbox. The sandbox itself denies Unix-socket binding, which doctor reports correctly.
 - Real Codex MCP `connect_claude` and `send_to_claude` reached an isolated Claude terminal. Claude's reply was received in the paired Codex conversation.
 - Claude initiated a second question; Codex's MCP reply arrived in the same Claude terminal. Both agents reported receipt without acknowledgement loops.

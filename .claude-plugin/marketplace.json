@@ -1,8 +1,10 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "cc-bridge",
-  "description": "Local marketplace for the Claude Code ⇄ Codex bridge.",
-  "owner": { "name": "Eduard Ruzsa" },
+  "description": "Claude Code ⇄ Codex bridge. Install with the setup in the repository README; the plugin alone does not configure Codex.",
+  "owner": {
+    "name": "Eduard Ruzsa"
+  },
   "plugins": [
     {
       "name": "cc-bridge",

@@ -1,0 +1,33 @@
+name: Bug report
+description: Something in the bridge doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: cc-bridge doctor
+      description: Output of `cc-bridge doctor`. Remove anything private.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: cc-bridge log
+      description: Relevant lines from `cc-bridge log -n 20`, if a message was involved. Remove anything private; messages can contain your code.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: cc-bridge, Claude Code (`claude --version`), Codex (`codex --version`), Node, Linux distribution
+      placeholder: cc-bridge 0.4.0, Claude Code 2.1.280, Codex 0.156.1, Node 22.23.2, Arch
+    validations:
+      required: true

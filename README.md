@@ -1,120 +1,184 @@
 # Claude ⇄ Codex bridge
 
-Ask either agent to discuss or review something with the other, without copying messages between terminals.
+Let Claude Code and OpenAI Codex talk to each other on your machine. Say *"ask Codex to review this"* in Claude, or *"ask Claude …"* in Codex, and the message goes straight to the other agent's session. The answer comes back the same way, so you don't copy text between terminals. If the other agent isn't running, the bridge opens it in a new terminal.
 
-## Setup
+Optionally, each agent can also review the other's plans before you see them.
 
-Requirements: Linux, Node **22.23.2 or newer**, Git, `flock` (util-linux), `xdg-terminal-exec` (or set `CC_BRIDGE_TERMINAL`), Claude Code with Channels and `--restricted`, a Claude login, and Codex with `codex queue`. Tested with Claude Code 2.1.280 and Codex 0.156.1. Linux is required for `/proc` and abstract sockets.
+```
+ Claude Code ──(Claude Channel, cc-bridge plugin)──┐
+      ▲                                            │ Unix socket (user-only)
+      │ channel events                             ▼
+      └──────────── cc-bridge ────────── codex queue ──▶ Codex
+                         ▲                                 │
+                         └──── cc-bridge MCP server ◀──────┘
+```
 
-After cloning this repository, run from its directory:
+- **Claude → Codex:** the `cc-bridge` Claude plugin is a [Claude Channel](https://code.claude.com/docs/en/channels-reference). Its `send_to_codex`/`reply` tools hand messages to `codex queue --thread <id>`.
+- **Codex → Claude:** a Codex MCP server (`send_to_claude`, `reply`, …) writes to the live Claude session's private socket, and the message appears in Claude as a channel event.
+- Sessions pair one-to-one by exact conversation ID, and the pairing survives resume.
+
+> **Status:** works day to day on Linux, but Claude Channels are a research preview. The bridge needs Claude Code's `--dangerously-load-development-channels` flag. That flag only enables this one channel; it doesn't bypass tool permissions.
+
+## Requirements
+
+- Linux (the bridge uses `/proc` and abstract Unix sockets)
+- Node **22.23.2** or newer, npm, Git, `flock` (util-linux)
+- Claude Code with Channels and `--restricted` (tested with 2.1.280), logged in
+- Codex with `codex queue` (tested with 0.156.1), logged in
+- A terminal launcher: `xdg-terminal-exec` by default, or any terminal set in the config
+
+## Install
 
 ```sh
+git clone https://github.com/eduardruzsa/claude-codex-bridge.git
+cd claude-codex-bridge
 npm run setup
 ```
 
-Setup installs the locked dependencies, registers `cc-bridge` in Codex, installs the `cc-bridge@cc-bridge` Claude plugin (this repository is its local marketplace), and links `claude-live` and `cc-bridge` into `~/.local/bin`. It is safe to repeat: other MCP entries are preserved, and unrelated files or conflicting registrations are never overwritten. Keep the repository at its installed path. Put `~/.local/bin` on PATH if necessary.
+Setup installs the locked dependencies and then:
 
-Restart Codex after installation or updates. After `git pull`, run `cc-bridge install` again to update the Claude plugin.
+1. registers the `cc-bridge` MCP server in Codex
+2. installs the `cc-bridge@cc-bridge` Claude plugin (this repository is its marketplace)
+3. links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on `PATH`)
 
-The Claude side is a plugin, and its channel loads in every Claude session. It stays dormant, with no tools and no socket, unless Claude was started with `claude-live`. Custom Channels need a startup flag, and `claude-live` is just `claude --dangerously-load-development-channels plugin:cc-bridge@cc-bridge "$@"`.
+It is safe to run again: other MCP servers and hooks are kept, and it never overwrites a file or registration that isn't its own. Keep the repository where you cloned it, because Codex runs the MCP server from there. Restart Codex afterwards.
+
+Then run `cc-bridge doctor`.
+
+**Updating:** `git pull && npm ci && cc-bridge install`, then restart Codex and any `claude-live` sessions.
 
 ## Daily use
 
-To use plain `claude`, add `alias claude="claude-live"` to your shell rc. Subcommands (`claude mcp`, `claude update`, `--version`, …) pass through unchanged, and scripts still reach the real binary. Plain `codex` works as is.
-
-
-1. In your project directory, start Claude:
+1. In your project, start Claude with the channel enabled:
    ```sh
-   claude-live
+   claude-live            # also: claude-live --continue, claude-live --resume <id>
    ```
-   Accept Claude's development-channel prompt when shown. `claude-live --continue` and `claude-live --resume <id>` also work.
-2. Say **“ask Codex to review this”**. You don't need to open Codex first:
-   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory. It connects and receives the message; approve its cc-bridge tool calls there.
+   Accept Claude's development-channel prompt when it appears.
+2. In Claude, say **"ask Codex to review this"**. You don't need to open Codex first:
+   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory and receives the message. Approve its cc-bridge tool calls there.
    - **Its paired Codex thread isn't running:** that thread is reopened (`codex resume`) and the message waits for it.
-3. It works the same the other way. In Codex, say **“ask Claude …”**:
-   - **No connection:** a *new* Claude conversation opens with `claude-live` in Codex's directory, pairs itself and receives the message. Accept the channel prompt there.
+3. It works the same in the other direction. In Codex, say **"ask Claude …"**:
+   - **No connection:** a *new* Claude conversation opens with `claude-live` in Codex's directory, pairs itself and receives the message.
    - **The paired Claude conversation isn't running:** it is reopened (`claude-live --resume <id>`).
-4. Either agent can now ask questions and reply. Ordinary terminal output is not forwarded; bridge tools carry the conversation.
+4. Both agents can ask and answer. Their ordinary terminal output is not forwarded; only the bridge tools send anything.
 
-Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation instead, tell it **“Connect to Claude session <label>”** (`cc-bridge sessions` lists them).
+To use plain `claude`, add `alias claude="claude-live"` to your shell rc. Subcommands (`claude mcp`, `claude update`, `--version`, …) pass through unchanged. Plain `codex` works as is.
 
-To run another Claude conversation alongside the first:
+Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation, tell it **"Connect to Claude session <label>"** (`cc-bridge sessions` lists them). For a second Claude conversation alongside the first:
 
 ```sh
 CC_BRIDGE_LABEL=review claude-live
 ```
 
-Matching uses the canonical Git working-tree root, or the canonical working directory outside Git. Subdirectories and symlinks match the same project; separate Git worktrees stay separate. You may explicitly select a conversation in another project.
+Matching uses the Git working-tree root (or the working directory outside Git), so subdirectories and symlinks count as the same project and separate worktrees stay separate.
 
-## Plan review
+The plugin loads in every Claude session but stays dormant (no tools, no socket) unless Claude was started with `claude-live`.
 
-Before a plan reaches you, the other agent reviews it. This works in every session, not only `claude-live`:
+## Configuration
 
-- **Claude Code plan mode:** when Claude calls `ExitPlanMode`, a read-only `codex exec` reviews the plan. If Codex has findings, Claude revises the plan once, adds a short "Codex review" section (what changed, and where it disagrees), and presents it.
-- **Codex plan mode:** when Codex ends a turn with a `<proposed_plan>`, a restricted read-only `claude -p` reviews it. Codex then revises the plan in the same way, adding a "Claude review" section.
-- "LGTM" passes straight through with a note. A reviewer failure never blocks: the plan passes with a warning.
-- Each review takes about a minute or two and uses the other agent's normal usage.
-- Turn it off for a session with `CC_BRIDGE_PLAN_REVIEW=0`.
+Settings live in `~/.config/cc-bridge/config.json`. Every key is optional.
 
-`cc-bridge install` adds the Codex `Stop` hook to `~/.codex/hooks.json`, keeping your other hooks. The Claude hook ships in the plugin. **Codex asks you once to trust the new hook** ("hooks need review", or run `/hooks`) the next time you open it. Until you do, Codex plans go unreviewed; `cc-bridge doctor` shows the trust status as Codex reports it.
+```sh
+cc-bridge config                  # effective values and where each comes from
+cc-bridge config init             # write the defaults (never overwrites)
+cc-bridge config set plan_review.review_claude_plans true
+```
 
-The Codex reviewer runs isolated: read-only sandbox, with hooks, plugins, apps and every configured MCP server turned off. If it can't be isolated, it doesn't run. The Claude reviewer runs with `--restricted` and read/search tools only.
+| Key | Default | Meaning | Env override |
+|---|---|---|---|
+| `claude_bin` | `"claude"` | Claude Code command | `CC_BRIDGE_CLAUDE_BIN` |
+| `codex_bin` | `"codex"` | Codex command | `CC_BRIDGE_CODEX_BIN` |
+| `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses `xdg-terminal-exec` | `CC_BRIDGE_TERMINAL` (space-separated) |
+| `default_label` | `"claude"` | Session label of `claude-live` | `CC_BRIDGE_LABEL` |
+| `data_dir` | `null` | Pairings, transcript, token. `null`: `~/.local/share/cc-bridge` | `CC_BRIDGE_DATA_DIR` |
+| `runtime_dir` | `null` | Sockets and launch state. `null`: `$XDG_RUNTIME_DIR/cc-bridge` | `CC_BRIDGE_RUNTIME_DIR` |
+| `plan_review.review_claude_plans` | `false` | Codex reviews Claude's plans | `CC_BRIDGE_PLAN_REVIEW=0/1` |
+| `plan_review.review_codex_plans` | `false` | Claude reviews Codex's plans (run `cc-bridge install` after changing) | `CC_BRIDGE_PLAN_REVIEW=0/1` |
+| `plan_review.timeout_seconds` | `480` | Longest a plan review may take (max 540) | |
+| `start_timeout_seconds` | `180` | How long a started agent has to connect before another send starts a new one | |
+| `consult_timeout_seconds` | `600` | Longest a `consult_claude` call may take | |
+| `max_exchange_depth` | `20` | Messages allowed in one exchange | |
+
+Environment variables win over the file. The path is fixed on purpose: Codex strips most environment variables from MCP servers, and the Claude plugin runs from a copy, so a file at a known path is what every part of the bridge can see. `CC_BRIDGE_CONFIG` points somewhere else (mainly for tests). Changes apply on the next action. Restart the agents after changing `claude_bin`, `data_dir` or `runtime_dir`.
+
+Some things are deliberately not configurable: the consultation and plan-reviewer tool restrictions described under [Security model](#security-model).
+
+## Plan review (optional)
+
+When enabled, the other agent reviews a plan before it reaches you:
+
+- **Claude Code plan mode** (`review_claude_plans`): when Claude calls `ExitPlanMode`, a read-only `codex exec` reviews the plan. If Codex has findings, Claude revises the plan once, adds a short "Codex review" section (what changed, and where it disagrees), and presents it.
+- **Codex plan mode** (`review_codex_plans`): when Codex ends a turn with a plan, a restricted read-only `claude -p` reviews it, and Codex revises it in the same way with a "Claude review" section.
+
+"LGTM" goes straight through with a note. A reviewer failure or timeout never blocks: the plan passes with a warning. **Each review uses the other agent's normal quota** and usually takes a minute or two. It applies to every session once enabled, not only `claude-live`.
+
+To turn it on:
+
+```sh
+cc-bridge config set plan_review.review_claude_plans true
+cc-bridge config set plan_review.review_codex_plans true
+cc-bridge install        # adds the Codex Stop hook
+```
+
+The Claude hook ships in the plugin and follows the config right away. The Codex side needs a `Stop` hook in `~/.codex/hooks.json`, which `cc-bridge install` adds only while `review_codex_plans` is on (and removes when it is off). **Codex asks you once to trust the new hook** ("hooks need review", or run `/hooks`); until then, Codex plans go unreviewed. `cc-bridge doctor` shows the trust status. `CC_BRIDGE_PLAN_REVIEW=0` or `=1` overrides the config for one session, but `=1` can't activate a Codex hook that isn't installed.
+
+## Security model
+
+- **Messages are requests, not permissions.** A bridge message asks for discussion or review. It never grants permission to edit, run state-changing commands or deploy. Both interactive agents keep their normal approval settings; the bridge bypasses none of them.
+- **Local and per-user.** Messages travel over a Unix socket in a `0700` runtime directory, authenticated with a random token in a `0700`/`0600` data directory. Nothing listens on the network.
+- **Identity from the hosts, not the model.** Codex supplies the calling thread through host metadata (`_meta.threadId`), which is cross-checked against the rollout files the Codex process has open. Claude pairings bind to the exact conversation ID. `project_dir` only narrows the candidates; it is not a credential.
+- **No rerouting.** A message never moves to another conversation. After `/clear` or a switched conversation, sends are refused until you reconnect explicitly. Sends are not retried, each message accepts one reply, and an exchange is capped at `max_exchange_depth`.
+- **Read-only helpers.** `consult_claude` and the Claude plan reviewer run `claude -p --restricted` with Read/Grep/Glob only and no MCP servers. The Codex plan reviewer runs `codex exec` in a read-only sandbox with hooks, plugins, apps and every configured MCP server disabled. If it can't be isolated, it doesn't run.
 
 ## Reconnecting
 
-- Resuming the **same conversation** preserves its pairing.
-- `/clear`, a new conversation, or switching to another conversation updates the channel identity. The old pairing becomes invalid. Tell Codex **“Connect to Claude session review”** (using your label) to explicitly reconnect.
-- During a transition, sends are refused rather than routed using an old identity. Delayed replies never move to a replacement conversation.
-- The plugin's `SessionStart`/`SessionEnd` hooks track identity in a private directory for each Claude process. They do nothing in sessions without the channel. If hooks are disabled by policy or settings, the channel falls back to the conversation id Claude was started with, so it won't follow `/clear`. Restricted consultations load no plugins.
-- If an old `claude-live` instance is still running after an update, restart it with `--resume` to enable lifecycle tracking.
+- Resuming the **same conversation** keeps its pairing.
+- `/clear`, a new conversation, or switching conversations changes the channel identity and invalidates the old pairing. Tell Codex **"Connect to Claude session <label>"** to reconnect.
+- The plugin's `SessionStart`/`SessionEnd` hooks track the conversation for each `claude-live` process and do nothing in other sessions. If hooks are disabled, the channel uses the conversation ID Claude was started with and won't follow `/clear`.
 
 ## Troubleshooting
 
 ```sh
-cc-bridge doctor       # capability, login, registration, PATH and socket checks
+cc-bridge doctor       # config, capabilities, logins, registration, PATH and socket checks
 cc-bridge sessions     # available conversations and their project directories
 cc-bridge status       # pairing state and recovery guidance
-cc-bridge log -n 20    # messages and delivery status
+cc-bridge log -n 20    # messages, delivery status and plan reviews
 ```
 
-`doctor` makes no model calls. Its socket check is local; a connected socket does not prove Channels was approved or that Codex is ready. Only a live question and reply verifies the full connection. Do not interpret `queued` as read or answered.
+`doctor` makes no model calls, and a passing socket check doesn't prove the channel was approved. Only a real question and reply does. `queued` means delivered to Codex, not read or answered.
 
-Repair an installation without reinstalling dependencies:
-
-```sh
-node bin/cc-bridge install
-```
-
-Manual pairing remains available while the Claude channel is running:
+Manual pairing while the Claude channel is running:
 
 ```sh
 cc-bridge pair --claude review --codex <thread-uuid>
 cc-bridge unpair --claude review
 ```
 
-## Agent tools
-
-Codex: `list_sessions`, `connect_claude(project_dir, session?)`, `send_to_claude`, `reply`, `bridge_status`, `pair_with_claude`, `consult_claude`, `list_consultations`.
-
-Claude: `send_to_codex`, `reply`, `bridge_status`.
-
-Codex supplies the calling thread identity through host metadata. `project_dir` only selects candidates; it is not an identity or authorization credential. An explicit session selection can replace a pairing, so agents must ask before choosing among candidates or changing an existing connection.
-
-`consult_claude` starts a separate restricted Claude session with Read/Grep/Glob only. Follow-ups accept only bridge-created session IDs and keep the original working directory.
-
-## Boundaries
-
-Bridge messages request discussion or review; they do not grant permission to edit, run state-changing commands, or deploy. Your interactive agents retain their normal permissions. Existing logins and usage allowances apply.
-
-Sessions are paired one-to-one using exact conversation IDs. Sends are asynchronous, never rerouted or automatically retried. Each message accepts one reply; exchanges are capped at 20 messages, and duplicate deliveries are rejected. Private state is stored under `~/.local/share/cc-bridge` (0700 directories, 0600 files); local sockets and launch state use the user runtime directory.
-
-Custom Claude Channels remain a research preview. The launcher enables only the named development channel, not a tool-permission bypass. [Claude Channels reference](https://code.claude.com/docs/en/channels-reference).
-
-## Tests
+## Uninstall
 
 ```sh
-npm test
-CC_BRIDGE_LIVE=1 node --test test/live.test.js
+cc-bridge uninstall            # Codex MCP server + hook, Claude plugin + marketplace, ~/.local/bin links
+cc-bridge uninstall --purge    # also pairings, transcript, token, sockets and the config file
 ```
 
-The standard suite uses isolated fake agents and real local sockets. The opt-in test uses Claude usage to verify actual consultation restrictions. Interactive round trips, resume and `/clear` must also be checked with real agents before claiming live integration is verified.
+It removes only entries that are recognisably the bridge's and reports anything it left alone. `--purge` deletes bridge-owned files by name and leaves any other files in those directories. Then delete the cloned repository.
+
+## Agent tools
+
+- **Codex:** `list_sessions`, `connect_claude(project_dir, session?)`, `send_to_claude`, `reply`, `bridge_status`, `pair_with_claude`, `consult_claude`, `list_consultations`
+- **Claude:** `send_to_codex`, `reply`, `bridge_status`
+
+An explicit session selection can replace a pairing, so agents are instructed to ask before choosing among candidates or changing a connection.
+
+## Development
+
+```sh
+npm test                                      # fake agents, real local sockets
+CC_BRIDGE_LIVE=1 node --test test/live.test.js # real Claude; uses a little quota
+```
+
+Interactive round trips, resume and `/clear` need real agents; see [docs/verification.md](docs/verification.md). Test-only environment variables: `CC_BRIDGE_ACTIVE`, `CC_BRIDGE_CLAUDE_PROC`, `CC_BRIDGE_LIFECYCLE_DIR`, `CC_BRIDGE_LIVE`, `CC_BRIDGE_CONFIG`.
+
+## License
+
+[MIT](LICENSE)
