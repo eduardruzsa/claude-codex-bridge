@@ -8,6 +8,10 @@ import {
 } from '../lib/common.js'
 import { install, doctor, uninstall } from '../lib/admin.js'
 import { SCHEMA, configPath, initConfig, loadConfig, setConfig } from '../lib/config.js'
+import { version } from '../lib/version.js'
+import { messages, formatMessages } from '../lib/messages.js'
+import { cancelPending } from '../lib/pending.js'
+import { retryMessage } from '../lib/recovery.js'
 import { listSessions, formatSessions } from '../lib/discovery.js'
 
 const [cmd, ...rest] = process.argv.slice(2)
@@ -25,9 +29,40 @@ const usage = `usage:
   cc-bridge pair --claude <label> --codex <thread-uuid>
   cc-bridge unpair --claude <label>
   cc-bridge status
-  cc-bridge log [-n 20]`
+  cc-bridge log [-n 20] [--verbose]
+  cc-bridge retry <message-id>
+  cc-bridge cancel <message-id>
+  cc-bridge --help | --version`
+
+const verbose = rest.includes('--verbose')
+const allowed = {
+  install: [], uninstall: ['--purge'], doctor: [], sessions: ['--verbose'], status: ['--verbose'],
+  pair: ['--claude', '--codex'], unpair: ['--claude'], log: ['-n', '--verbose'],
+}
+if (rest.includes('--help') || ['help', '--help', '-h'].includes(cmd) || !cmd) { console.log(usage); process.exit(0) }
+if (['--version', '-v'].includes(cmd)) { console.log(version); process.exit(0) }
+function usageError(message) { console.error(`cc-bridge: ${message}\n${usage}`); process.exit(2) }
+if (cmd in allowed) {
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i]
+    if (!allowed[cmd].includes(arg)) usageError(`Unexpected argument: ${arg}`)
+    if (['--claude', '--codex', '-n'].includes(arg)) {
+      if (!rest[i + 1] || rest[i + 1].startsWith('-')) usageError(`Missing value for ${arg}`)
+      i++
+    }
+  }
+}
+if (['retry', 'cancel'].includes(cmd) && (rest.length !== 1 || !/^[0-9a-f-]{36}$/.test(rest[0]))) usageError('Expected a message ID')
+if (cmd === 'config' && !(!rest.length || (rest[0] === 'init' && rest.length === 1) || (rest[0] === 'get' && rest.length === 2) || (rest[0] === 'set' && rest.length === 3))) usageError('Invalid config arguments')
+try {
 
 switch (cmd) {
+  case 'retry':
+    console.log(await retryMessage(rest[0]))
+    break
+  case 'cancel':
+    await cancelPending(rest[0]); console.log(`Cancelled request ${rest[0]}`)
+    break
   case 'install':
     try { console.log(install()) } catch (e) { console.error(e.message); process.exitCode = 1 }
     break
@@ -67,13 +102,13 @@ switch (cmd) {
   case 'doctor': {
     const checks = await doctor()
     for (const c of checks) console.log(`${c.ok ? 'OK' : 'FAIL'} ${c.name}${c.ok ? '' : ` — ${c.fix}`}`)
-    console.log(formatSessions(await listSessions()))
+    console.log(formatSessions(await listSessions(), { verbose }))
     console.log('Channels activation is confirmed only by a live round trip; no model calls were made.')
     process.exitCode = checks.some(c => !c.ok) ? 1 : 0
     break
   }
   case 'sessions':
-    console.log(formatSessions(await listSessions()))
+    console.log(formatSessions(await listSessions(), { verbose }))
     break
   case 'pair': {
     const label = flag('claude')
@@ -102,29 +137,26 @@ switch (cmd) {
     break
   }
   case 'status': {
-    console.log(`data: ${dataDir()}`)
-    console.log(formatSessions(await listSessions()))
+    if (verbose) console.log(`data: ${dataDir()}`)
+    console.log(formatSessions(await listSessions(), { verbose }))
     break
   }
   case 'log': {
-    const n = Number(rest[rest.indexOf('-n') + 1]) || 20
+    const index = rest.indexOf('-n')
+    const n = index === -1 ? 20 : Number(rest[index + 1])
+    if (!Number.isSafeInteger(n) || n < 1) usageError('-n must be a positive integer')
     const events = readTranscript()
-    const status = new Map()
-    for (const e of events) if (e.event !== 'sent') status.set(e.msg_id, e.event + (e.error ? ` (${e.error})` : ''))
-    for (const e of events.filter(e => e.event === 'sent' || e.event === 'plan_review').slice(-n)) {
-      if (e.event === 'plan_review') {
-        console.log(`${e.ts}  plan review  ${e.author}'s plan, reviewed by ${e.reviewer}  [${e.outcome}]  ${e.cwd}`)
-        if (e.review) console.log(`  ${e.review.replace(/\n/g, '\n  ')}`)
-        console.log()
-        continue
-      }
-      console.log(`${e.ts}  ${e.kind}  ${e.from} → ${e.to}  [${status.get(e.msg_id) || 'pending'}]`)
-      console.log(`  msg_id=${e.msg_id}${e.reply_to ? `  in_reply_to=${e.reply_to}` : ''}`)
-      console.log(`  ${e.text.replace(/\n/g, '\n  ')}\n`)
+    const entries = [...messages(events), ...events.filter(e => e.event === 'plan_review')]
+      .sort((a, b) => (a.created_at || a.ts).localeCompare(b.created_at || b.ts)).slice(-n)
+    if (!entries.length) console.log('No bridge requests yet.')
+    for (const e of entries) {
+      if (e.event === 'plan_review') console.log(`${e.ts}  plan review  ${e.author} → ${e.reviewer}  [${e.outcome}]\n${e.review || ''}`)
+      else console.log(formatMessages([e], { verbose }))
     }
     break
   }
   default:
-    console.log(usage)
-    process.exit(cmd ? 2 : 0)
+    usageError(`Unknown command: ${cmd}`)
 }
+
+} catch (err) { console.error(`cc-bridge: ${err.message}`); process.exitCode = 1 }
