@@ -18,6 +18,8 @@ npm test
 
 `npm test` uses fake `claude`/`codex` binaries and temporary directories, so it needs neither agent and never touches your real configuration. You only need a real install (`npm run setup`) to try changes end to end.
 
+`CC_BRIDGE_LIVE=1 node --test test/live.test.js` runs one test against the real Claude and uses a little quota. The environment variables `CC_BRIDGE_ACTIVE`, `CC_BRIDGE_CLAUDE_PROC`, `CC_BRIDGE_LIFECYCLE_DIR`, `CC_BRIDGE_LIVE` and `CC_BRIDGE_CONFIG` exist for tests.
+
 ## Pull requests
 
 1. Keep each PR to one change, and add or update tests for it.
