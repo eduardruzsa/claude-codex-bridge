@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping. Bug reports, fixes and docs improvements are all welcome.
+Thanks for helping. Bug reports, fixes and docs improvements are all welcome. If you work with a coding agent, it will pick up [AGENTS.md](AGENTS.md), which has the commands, layout and the rules that must hold.
 
 ## Before you start
 
@@ -17,6 +17,8 @@ npm test
 ```
 
 `npm test` uses fake `claude`/`codex` binaries and temporary directories, so it needs neither agent and never touches your real configuration. You only need a real install (`npm run setup`) to try changes end to end.
+
+`CC_BRIDGE_LIVE=1 node --test test/live.test.js` runs one test against the real Claude and uses a little quota. The environment variables `CC_BRIDGE_ACTIVE`, `CC_BRIDGE_CLAUDE_PROC`, `CC_BRIDGE_LIFECYCLE_DIR`, `CC_BRIDGE_LIVE` and `CC_BRIDGE_CONFIG` exist for tests.
 
 ## Pull requests
 
