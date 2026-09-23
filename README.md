@@ -52,6 +52,28 @@ npm run setup
 
 Then run `cc-bridge doctor`.
 
+### What you'll be asked to allow
+
+**Claude: a development-channel flag.** Custom Claude Channels are a research preview, so Claude Code only loads one when it is started with `--dangerously-load-development-channels`. `claude-live` passes it for you (`claude --dangerously-load-development-channels plugin:cc-bridge@cc-bridge`). The first time, Claude asks you to confirm loading the development channel. The flag enables only this channel. It does not skip tool permissions, and your Claude session keeps asking for approvals as usual.
+
+**Codex: approving the cc-bridge tools.** Codex asks before every MCP tool call, including the bridge's `send_to_claude` and `reply`. To stop being asked, allow the bridge's tools in `~/.codex/config.toml`, under the entry setup created:
+
+```toml
+[mcp_servers.cc-bridge]
+# command and args as written by setup
+default_tools_approval_mode = "approve"
+
+# optional: keep asking before consultations, which use your Claude quota
+[mcp_servers.cc-bridge.tools.consult_claude]
+approval_mode = "prompt"
+```
+
+Without this:
+- With approval policy `never` (and in `codex exec`, which defaults to it), every bridge call is refused.
+- With `approvals_reviewer = "auto_review"`, the automatic reviewer may reject a message whose text includes details from your repository, because it can't verify who receives it. Answer the prompt yourself, or allow the tools as above.
+
+Allowing them only lets Codex send and read bridge messages. The Claude on the other end still asks you before it edits anything or runs commands.
+
 **Updating:** `git pull && npm ci && cc-bridge install`, then restart Codex and any `claude-live` sessions.
 
 ## Daily use
@@ -60,9 +82,9 @@ Then run `cc-bridge doctor`.
    ```sh
    claude-live            # also: claude-live --continue, claude-live --resume <id>
    ```
-   Accept Claude's development-channel prompt when it appears.
+   Accept Claude's development-channel prompt when it appears (see [What you'll be asked to allow](#what-youll-be-asked-to-allow)).
 2. In Claude, say **"ask Codex to review this"**. You don't need to open Codex first:
-   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory and receives the message. Approve its cc-bridge tool calls there.
+   - **This conversation has no Codex connection:** a *new* Codex conversation opens in a terminal in the same directory and receives the message. Approve its cc-bridge tool calls there, unless you allowed them in the Codex config.
    - **Its paired Codex thread isn't running:** that thread is reopened (`codex resume`) and the message waits for it.
 3. It works the same in the other direction. In Codex, say **"ask Claude …"**:
    - **No connection:** a *new* Claude conversation opens with `claude-live` in Codex's directory, pairs itself and receives the message.
@@ -71,7 +93,7 @@ Then run `cc-bridge doctor`.
 
 To use plain `claude`, add `alias claude="claude-live"` to your shell rc. Subcommands (`claude mcp`, `claude update`, `--version`, …) pass through unchanged. Plain `codex` works as is.
 
-Each start opens one terminal. A second message sent while the other agent is still starting joins the first one instead of opening another window. To attach Codex to an *existing* Claude conversation, tell it **"Connect to Claude session <label>"** (`cc-bridge sessions` lists them).
+Each start opens one terminal. More messages join the same startup, even if approval takes longer than the startup timeout. Requests keep their original IDs and timestamps. Closing the window does not automatically reopen it; waiting requests remain available for recovery. To attach Codex to an *existing* Claude conversation, tell it **"Connect to Claude session <label>"** (`cc-bridge sessions` lists them).
 
 Each running Claude conversation has a **label** (`claude` by default). Run as many `claude-live` sessions as you like: when `claude` is taken, the next one gets `claude-2`, then `claude-3`, and so on. A resumed conversation gets back the label it is paired under, if that label is free. To choose the name yourself, set it explicitly; an explicit label is never swapped for another one:
 
@@ -104,7 +126,7 @@ cc-bridge config set plan_review.review_claude_plans true
 | `plan_review.review_claude_plans` | `false` | Codex reviews Claude's plans | `CC_BRIDGE_PLAN_REVIEW=0/1` |
 | `plan_review.review_codex_plans` | `false` | Claude reviews Codex's plans (run `cc-bridge install` after changing) | `CC_BRIDGE_PLAN_REVIEW=0/1` |
 | `plan_review.timeout_seconds` | `480` | Longest a plan review may take (max 540) | |
-| `start_timeout_seconds` | `180` | How long a started agent has to connect before another send starts a new one | |
+| `start_timeout_seconds` | `180` | How long before startup is shown as waiting; does not launch another window | |
 | `consult_timeout_seconds` | `600` | Longest a `consult_claude` call may take | |
 | `max_exchange_depth` | `20` | Messages allowed in one exchange | |
 
@@ -136,7 +158,7 @@ The Claude hook ships in the plugin and follows the config right away. The Codex
 - **Messages are requests, not permissions.** A bridge message asks for discussion or review. It never grants permission to edit, run state-changing commands or deploy. Both interactive agents keep their normal approval settings; the bridge bypasses none of them.
 - **Local and per-user.** Messages travel over a Unix socket in a `0700` runtime directory, authenticated with a random token in a `0700`/`0600` data directory. Nothing listens on the network. Other users on the machine can't reach the bridge, but processes running as **your** user (and root) can read the token and transcript and are trusted, as they are for your agents' own files.
 - **Identity from the hosts, not the model.** Codex supplies the calling thread through host metadata (`_meta.threadId`), which is cross-checked against the rollout files the Codex process has open. Claude pairings bind to the exact conversation ID. `project_dir` only narrows the candidates; it is not a credential.
-- **No rerouting.** A message never moves to another conversation. After `/clear` or a switched conversation, sends are refused until you reconnect explicitly. Sends are not retried, each message accepts one reply, and an exchange is capped at `max_exchange_depth`.
+- **No rerouting.** A message never moves to another conversation. After `/clear` or a switched conversation, old pending requests are recorded as dropped; new exchanges use a fresh conversation. Handoffs are not automatically retried, each message accepts one reply, and an exchange is capped at `max_exchange_depth`.
 - **Read-only helpers.** `consult_claude` and the Claude plan reviewer run `claude -p --restricted` with Read/Grep/Glob only and no MCP servers. The Codex plan reviewer runs `codex exec` in a read-only sandbox with hooks, plugins, apps and every configured MCP server disabled. If it can't be isolated, it doesn't run.
 
 ## Reconnecting
@@ -150,11 +172,23 @@ The Claude hook ships in the plugin and follows the config right away. The Codex
 ```sh
 cc-bridge doctor       # config, capabilities, logins, registration, PATH and socket checks
 cc-bridge sessions     # available conversations and their project directories
-cc-bridge status       # pairing state and recovery guidance
+cc-bridge status       # startup, waiting requests, connection state and recovery guidance
+cc-bridge status --verbose # include full session identifiers
 cc-bridge log -n 20    # messages, delivery status and plan reviews
 ```
 
-`doctor` makes no model calls, and a passing socket check doesn't prove the channel was approved. Only a real question and reply does. `queued` means delivered to Codex, not read or answered.
+`doctor` makes no model calls, and a passing socket check doesn't prove the channel was approved. Only a real question and reply does. `queued to Codex` means its queue accepted the message, not that the agent read it. Claude channel notifications have no receipt acknowledgement: `notification sent; receipt unconfirmed` is intentional. Only an actual reply changes a request to `replied`. Approve the channel prompt before relying on notifications; a notification submitted before approval may not reach the agent.
+
+Every waiting request appears in `status` and `log`, including its request ID. If an agent exits or startup fails, the recovery hint provides one command:
+
+```sh
+cc-bridge retry <message-id>    # recover startup for the original destination
+cc-bridge cancel <message-id>   # cancel a request before handover is claimed
+```
+
+Retry refuses to open a duplicate while the agent wrapper is running. A retry of an already queued Codex message only reopens its original conversation; it does not queue the message again. An explicit retry of an unconfirmed Codex queue attempt may duplicate a request, because that queue provides no deduplication. Claude deduplication prevents resubmitting a notification already recorded as sent; if no reply arrives, ask the agent to send a new request. Cancellation cannot recall a notification or queued message.
+
+Interrupted handovers stay visible as unconfirmed. Old requests are never silently reassigned after a conversation change. The launch wrapper records the agent process separately from the terminal launcher, so an exited launcher does not trigger another window. Legacy pending records are upgraded when processed; restart both agents after updating so they use the same pending format.
 
 Manual pairing while the Claude channel is running:
 
