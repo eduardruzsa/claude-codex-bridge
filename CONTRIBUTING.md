@@ -21,7 +21,7 @@ npm test
 ## Pull requests
 
 1. Keep each PR to one change, and add or update tests for it.
-2. `npm test` must pass (CI runs it on Node 22 and 24).
+2. `npm test` must pass (CI runs it on Node 22, the oldest supported, and on the latest LTS).
 3. Match the surrounding style: ES modules, no build step, no new runtime dependencies without discussion.
 4. If you change the channel, discovery, lifecycle or launch code, repeat the relevant checks in [docs/verification.md](docs/verification.md) with real agents and say so in the PR.
 5. Update the README, `config.example.json` and `CHANGELOG.md` when you change user-facing behavior or settings.

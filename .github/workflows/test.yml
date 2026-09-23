@@ -14,7 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ['22', '24']
+        # Oldest supported (package.json engines) and whatever the latest LTS is.
+        node: ['22', 'lts/*']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
