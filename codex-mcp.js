@@ -114,8 +114,18 @@ function openCodexThreads() {
   return threads
 }
 
+function turnMetadata(meta) {
+  const raw = meta?.['x-codex-turn-metadata']
+  if (typeof raw !== 'string') return raw
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+}
+
 function callerThread(meta) {
-  const t = String(meta?.threadId || meta?.['x-codex-turn-metadata']?.thread_id || '').toLowerCase()
+  const t = String(meta?.threadId || turnMetadata(meta)?.thread_id || '').toLowerCase()
   if (!isUuid(t)) throw new Error('Codex did not identify the calling thread (no _meta.threadId on the tool call)')
   if (!openCodexThreads().has(t)) throw new Error(`calling thread ${t} is not open in the Codex process running this bridge`)
   return t
@@ -139,14 +149,11 @@ async function replyToClaude(args, thread) {
   const events = readTranscript()
   const original = findMessage(args.msg_id, events)
   if (!original) return fail(`unknown msg_id ${args.msg_id}`)
-  validateReply(args.msg_id, codexParty(thread), events)
   const { side, id: label } = parseParty(original.from)
   if (side !== 'claude') return fail(`msg_id ${args.msg_id} did not come from Claude`)
   const pair = loadPairs()[label]
   if (pair?.codex !== thread) return fail(`Claude session "${label}" is no longer paired with thread ${thread}; not rerouting`)
-  if (pair.claude_session !== original.claude_session) {
-    return fail(`msg_id ${args.msg_id} came from Claude conversation ${original.claude_session}, but "${label}" is now conversation ${pair.claude_session}; not rerouting`)
-  }
+  validateReply(args.msg_id, codexParty(thread), pair.claude_session, events)
   const res = await deliverToClaude({ fromThread: thread, label, claudeSession: pair.claude_session, text: String(args.text || ''), replyToId: original.msg_id, kind: 'reply' })
   if (res.status === 'delivered') return text(`reply delivered to Claude session "${label}" (msg_id ${res.msg_id}).`)
   return fail(`${res.status}: reply msg_id ${res.msg_id} not delivered to Claude session "${label}"${res.error ? ` (${res.error})` : ''}. Not retried.`)

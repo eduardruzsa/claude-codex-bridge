@@ -4,7 +4,6 @@
 // open the way a real Codex process does.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
@@ -52,7 +51,7 @@ process.stdin.on('data', d => (input += d)).on('end', () => {
 })
 `, { mode: 0o755 })
 
-const { pairLive } = await import('../lib/common.js')
+const { labelMutexName, pairLive } = await import('../lib/common.js')
 
 async function connect(command, args, extraEnv) {
   const client = new Client({ name: 'test', version: '0' })
@@ -60,8 +59,9 @@ async function connect(command, args, extraEnv) {
   client.fallbackNotificationHandler = async n => notifications.push(n)
   await client.connect(new StdioClientTransport({ command, args, env: { ...env, ...extraEnv } }))
   // as_thread plays the Codex host: it becomes _meta.threadId, never a tool argument.
-  const call = async (name, { as_thread, ...a } = {}) => {
-    const res = await client.callTool({ name, arguments: a, ...(as_thread && { _meta: { threadId: as_thread } }) })
+  const call = async (name, { as_thread, raw_meta, ...a } = {}) => {
+    const _meta = raw_meta || (as_thread && { threadId: as_thread })
+    const res = await client.callTool({ name, arguments: a, ...(_meta && { _meta }) })
     return { ok: !res.isError, text: res.content.map(c => c.text).join('') }
   }
   return { client, notifications, call }
@@ -173,6 +173,39 @@ test('duplicate delivery is dropped, bad token rejected', async () => {
   assert.equal(raw.error, 'unauthorized')
 })
 
+test('concurrent duplicates and repeated lines deliver once', async () => {
+  const { authToken, newId, sendToClaudeSocket } = await import('../lib/common.js')
+  const before = claude.notifications.filter(channel).length
+  const msg = { op: 'deliver', msg_id: newId(), from: `codex:${THREAD}`, to: 'claude:t1', claude_session: claude.session, text: 'once' }
+  const results = await Promise.all([1, 2, 3, 4].map(() => sendToClaudeSocket('t1', msg)))
+  assert.deepEqual(results.map(r => r.status).sort(), ['delivered', 'duplicate', 'duplicate', 'duplicate'])
+
+  // One connection writing the same request line twice.
+  const line = JSON.stringify({ token: authToken(), ...msg, msg_id: newId() }) + '\n'
+  await new Promise(resolve => {
+    const s = net.createConnection(sockFile('t1'))
+    s.on('connect', () => {
+      s.write(line)
+      s.write(line)
+    })
+    s.on('data', () => {}).on('close', resolve)
+  })
+  await new Promise(r => setTimeout(r, 200))
+  assert.equal(claude.notifications.filter(channel).length - before, 2)
+})
+
+test('a peer that closes without answering settles the request', async () => {
+  const { sendToClaudeSocket } = await import('../lib/common.js')
+  const server = net.createServer(c => c.resume().end()) // accept, then hang up silently
+  await new Promise(r => server.listen(sockFile('closer'), r))
+  const started = Date.now()
+  const res = await sendToClaudeSocket('closer', { op: 'ping' }, 5000)
+  assert.equal(res.status, 'error')
+  assert.match(res.error, /closed without a response/)
+  assert.ok(Date.now() - started < 1000)
+  await new Promise(r => server.close(r))
+})
+
 test('routing errors: unknown session, wrong thread, unpaired', async () => {
   const unknown = await codex.call('send_to_claude', { text: 'x', session: 'nope', as_thread: THREAD })
   assert.ok(!unknown.ok)
@@ -210,6 +243,10 @@ test('Codex identity comes from the host _meta, is checked against the process, 
   assert.match((await waitFor(() => claude.notifications.filter(channel)[before])).params.meta.from, new RegExp(THREAD))
   assert.match((await codex.call('bridge_status', { as_thread: THREAD })).text, new RegExp(`this thread: ${THREAD}`))
 
+  // Codex may send the turn metadata as a JSON string instead of an object.
+  const asString = await codex.call('bridge_status', { raw_meta: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: THREAD }) } })
+  assert.match(asString.text, new RegExp(`this thread: ${THREAD}`))
+
   const none = await startCodex([])
   const n = await none.call('send_to_claude', { text: 'x', session: 't1', as_thread: THREAD })
   assert.match(n.text, /not open in the Codex process/)
@@ -233,12 +270,12 @@ test('replies never reach a conversation that took over the label', async () => 
   await pairLive('t7', T7) // same Codex thread, new conversation
   const r = await codex.call('reply', { msg_id: fromA, text: 'answer for A', as_thread: T7 })
   assert.ok(!r.ok)
-  assert.match(r.text, /came from Claude conversation conv-A7, but "t7" is now conversation conv-B7; not rerouting/)
+  assert.match(r.text, /belongs to Claude conversation conv-A7, not conv-B7; not rerouting/)
   assert.equal(b.notifications.filter(channel).length, 0)
 
   const rb = await b.call('reply', { msg_id: toA, text: 'B answering A\'s mail' })
   assert.ok(!rb.ok)
-  assert.match(rb.text, /addressed to Claude conversation conv-A7, not this one/)
+  assert.match(rb.text, /belongs to Claude conversation conv-A7, not conv-B7; not rerouting/)
   await b.client.close()
 })
 
@@ -269,9 +306,6 @@ test('a new Claude conversation reusing a label does not inherit the pairing', a
   await second.client.close()
 })
 
-const mutexName = label =>
-  `\0cc-bridge-${crypto.createHash('sha256').update(sockFile(label)).digest('hex').slice(0, 32)}`
-
 test('a live label owner is never displaced, even if unresponsive', async () => {
   const dup = await startClaude('t1', 'claude-sess-dup')
   await new Promise(r => setTimeout(r, 300))
@@ -280,7 +314,7 @@ test('a live label owner is never displaced, even if unresponsive', async () => 
   assert.ok((await codex.call('send_to_claude', { text: 'still there?', as_thread: THREAD })).ok)
 
   // A stalled owner: holds the label, answers nothing.
-  const stalled = spawn('node', ['-e', `require('net').createServer().listen(${JSON.stringify(mutexName('t5'))}, () => console.log('held')); setInterval(() => {}, 1000)`])
+  const stalled = spawn('node', ['-e', `require('net').createServer().listen(${JSON.stringify(labelMutexName('t5'))}, () => console.log('held')); setInterval(() => {}, 1000)`])
   await new Promise(r => stalled.stdout.once('data', r))
   const late = await startClaude('t5', 'claude-sess-late')
   await new Promise(r => setTimeout(r, 300))
@@ -302,6 +336,36 @@ test('concurrent starters: exactly one wins; a dead owner\'s socket is taken ove
   assert.equal((await sendToClaudeSocket('t6', { op: 'ping' })).session, winner.session) // losers' exits left it alone
   await winner.client.close()
   await waitFor(() => !fs.existsSync(sockFile('t6')))
+})
+
+test('a socket served by a process outside the mutex is never replaced; the label is released', async () => {
+  // e.g. an owner in another network namespace, invisible to the abstract mutex
+  const outsider = net.createServer(c => c.resume().end())
+  await new Promise(r => outsider.listen(sockFile('t8'), r))
+  const blocked = await startClaude('t8', 'conv-t8a')
+  await new Promise(r => setTimeout(r, 300))
+  assert.match((await blocked.call('bridge_status')).text, /NOT listening: a live process is still serving/)
+  assert.ok(fs.existsSync(sockFile('t8')))
+  await new Promise(r => outsider.close(r))
+
+  // The failed starter released the label, so a new starter (same process lifetime) can take it.
+  const next = await startClaude('t8', 'conv-t8b')
+  await new Promise(r => setTimeout(r, 300))
+  assert.match((await next.call('bridge_status')).text, /\(listening\)/)
+  await next.client.close()
+  await blocked.client.close()
+})
+
+test('exit cleanup removes only its own socket file', async () => {
+  const a = await startClaude('t9', 'conv-t9')
+  await waitFor(() => fs.existsSync(sockFile('t9')))
+  fs.unlinkSync(sockFile('t9'))
+  const successor = net.createServer(c => c.resume().end())
+  await new Promise(r => successor.listen(sockFile('t9'), r))
+  await a.client.close()
+  await new Promise(r => setTimeout(r, 300))
+  assert.ok(fs.existsSync(sockFile('t9')), "a's exit removed the successor's socket")
+  await new Promise(r => successor.close(r))
 })
 
 test('failed codex queue is reported, not retried, and does not consume the reply', async () => {

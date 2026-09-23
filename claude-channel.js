@@ -3,7 +3,6 @@
 // Launched by Claude Code over stdio (see bin/claude-live). Codex messages
 // arrive on a user-only Unix socket and are pushed into the session as
 // <channel source="cc-bridge" ...> events.
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -12,6 +11,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import {
   RULES,
   authToken,
+  labelMutexName,
   claudeParty,
   loadPairs,
   parseParty,
@@ -107,9 +107,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'send_to_codex':
         return await sendToPairedCodex(String(args.text || ''), null, 'message')
       case 'reply': {
-        const original = validateReply(String(args.msg_id), me)
+        const original = validateReply(String(args.msg_id), me, mySession)
         if (parseParty(original.from).side !== 'codex') return fail(`msg_id ${args.msg_id} did not come from Codex`)
-        if (original.claude_session !== mySession) return fail(`msg_id ${args.msg_id} was addressed to Claude conversation ${original.claude_session}, not this one`)
         const paired = myPair().codex
         const origThread = parseParty(original.from).id
         if (paired !== origThread) return fail(`msg_id ${args.msg_id} came from Codex thread ${origThread}, but this session is now paired with ${paired}; not rerouting`)
@@ -142,6 +141,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 // ---- Inbound socket ----------------------------------------------------------------
 
+const claimed = new Set() // msg_ids accepted by this process, including in-flight ones
+
 async function handleRequest(req) {
   if (req.token !== authToken()) return { status: 'error', error: 'unauthorized' }
   if (req.op === 'ping') return { status: 'ok', label, session: mySession }
@@ -151,11 +152,24 @@ async function handleRequest(req) {
     return { status: 'session_changed', error: `label "${label}" is now Claude conversation ${mySession}, not the paired ${req.claude_session}; re-pair` }
   }
   if (parseParty(req.from).side !== 'codex') return { status: 'error', error: 'sender must be a Codex thread' }
-  if (wasDelivered(req.msg_id)) {
+  // Reserve the id synchronously, before any await, so concurrent duplicates can't both pass.
+  if (claimed.has(req.msg_id) || wasDelivered(req.msg_id)) {
     record({ event: 'duplicate', msg_id: req.msg_id })
     return { status: 'duplicate' }
   }
-  await mcp.notification({
+  claimed.add(req.msg_id)
+  try {
+    await pushToClaude(req)
+  } catch (err) {
+    claimed.delete(req.msg_id)
+    throw err
+  }
+  record({ event: 'delivered', msg_id: req.msg_id })
+  return { status: 'delivered' }
+}
+
+function pushToClaude(req) {
+  return mcp.notification({
     method: 'notifications/claude/channel',
     params: {
       content: String(req.text),
@@ -167,20 +181,21 @@ async function handleRequest(req) {
       },
     },
   })
-  record({ event: 'delivered', msg_id: req.msg_id })
-  return { status: 'delivered' }
 }
 
 function serve(conn) {
   let buf = ''
+  let handled = false // one request per connection; later bytes are ignored
   conn.setEncoding('utf8')
   conn.on('data', async chunk => {
+    if (handled) return
     buf += chunk
     const nl = buf.indexOf('\n')
     if (nl === -1) {
       if (buf.length > 1_000_000) conn.destroy()
       return
     }
+    handled = true
     let res
     try {
       res = await handleRequest(JSON.parse(buf.slice(0, nl)))
@@ -193,42 +208,64 @@ function serve(conn) {
 }
 
 // Exclusive ownership of the label: a Linux abstract-namespace socket bound only as a
-// mutex. The kernel allows one binder and releases it when the process dies, so there
-// is no stale lock to recover and no read-then-delete race. Whoever holds it may
-// replace the (then necessarily stale) socket file; our exit cleanup runs while we
-// still hold it, so it can never remove a successor's socket.
-function acquireLabel(sockPath) {
-  const key = crypto.createHash('sha256').update(sockPath).digest('hex').slice(0, 32)
+// mutex (name from labelMutexName). The kernel allows one binder and releases it when
+// the process dies, so there is no stale lock to recover and no read-then-delete race.
+function acquireLabel() {
   const mutex = net.createServer(c => c.destroy())
   return new Promise((resolve, reject) => {
     mutex.once('error', err =>
       reject(err.code === 'EADDRINUSE'
         ? new Error(`another live Claude session already uses label "${label}"; set CC_BRIDGE_LABEL to a different name`)
         : err))
-    mutex.listen(`\0cc-bridge-${key}`, resolve)
+    mutex.listen(labelMutexName(label), () => resolve(mutex))
+  })
+}
+
+// An existing socket file is removed only when provably dead (nothing accepts on it).
+// This also covers an owner the mutex can't see, e.g. one in another network namespace.
+function socketIsDead(sockPath) {
+  return new Promise(resolve => {
+    const probe = net.createConnection(sockPath)
+    probe.setTimeout(1000, () => {
+      probe.destroy()
+      resolve(false) // slow is not dead
+    })
+    probe.on('connect', () => {
+      probe.destroy()
+      resolve(false)
+    })
+    probe.on('error', err => resolve(['ENOENT', 'ECONNREFUSED'].includes(err.code)))
   })
 }
 
 async function listen() {
   if (!mySession) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
   const sockPath = paths.socket(label)
-  await acquireLabel(sockPath)
+  const mutex = await acquireLabel()
+  try {
+    if (fs.existsSync(sockPath)) {
+      if (!(await socketIsDead(sockPath))) throw new Error(`a live process is still serving ${sockPath}; not replacing it`)
+      fs.unlinkSync(sockPath)
+    }
+    const server = net.createServer(serve)
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(sockPath, resolve)
+    })
+  } catch (err) {
+    mutex.close() // don't keep the label while not listening
+    throw err
+  }
+  fs.chmodSync(sockPath, 0o600)
+  const { ino, dev } = fs.statSync(sockPath)
   process.on('exit', () => {
     try {
-      fs.unlinkSync(sockPath)
+      const st = fs.statSync(sockPath)
+      if (st.ino === ino && st.dev === dev) fs.unlinkSync(sockPath) // only our own socket
     } catch {}
   })
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(0))
   process.stdin.on('close', () => process.exit(0))
-  try {
-    fs.unlinkSync(sockPath) // we own the label, so any socket file here is stale
-  } catch {}
-  const server = net.createServer(serve)
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(sockPath, resolve)
-  })
-  fs.chmodSync(sockPath, 0o600)
 }
 
 await mcp.connect(new StdioServerTransport())
