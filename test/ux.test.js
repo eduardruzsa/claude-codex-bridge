@@ -62,10 +62,18 @@ function hook(dir, sid, event, source = 'startup', cwd = tmp) {
 
 test('installer is repeatable, preserves other servers and rejects conflicts before changing links', () => {
   const home = path.join(tmp, 'home')
+  const hooksFile = path.join(home, '.codex', 'hooks.json')
+  fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
+  fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
   install({ home })
   const first = fs.readFileSync(config, 'utf8')
   install({ home })
   assert.equal(fs.readFileSync(config, 'utf8'), first)
+  // The Codex plan-review Stop hook is added once and other hooks are kept.
+  const stop = JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command))
+  assert.equal(stop.length, 2)
+  assert.equal(stop[0], 'keep-me')
+  assert.match(stop[1], /bin\/plan-review" --codex$/)
   assert.equal(JSON.parse(first).other.command, 'preserve-me')
   assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
   const conflictingHome = path.join(tmp, 'conflict')

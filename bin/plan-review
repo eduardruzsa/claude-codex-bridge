@@ -1,0 +1,74 @@
+#!/usr/bin/env node
+// Hook entry for plan cross-review.
+//   --claude: Claude Code PreToolUse hook on ExitPlanMode → Codex reviews the plan.
+//   --codex:  Codex Stop hook; when the turn ends with a <proposed_plan> → Claude reviews it.
+// Findings send the author back to revise once; LGTM or a reviewer failure lets the
+// plan through with a visible note.
+import fs from 'node:fs'
+import {
+  claudeReview,
+  codexReview,
+  extractProposedPlan,
+  isLgtm,
+  markReviewedRound,
+  takeReviewedRound,
+} from '../lib/plan-review.js'
+
+const side = process.argv[2]
+const input = JSON.parse(fs.readFileSync(0, 'utf8') || '{}')
+const emit = obj => process.stdout.write(JSON.stringify(obj))
+if (process.env.CC_BRIDGE_PLAN_REVIEW === '0') process.exit(0)
+const cwd = input.cwd && fs.existsSync(input.cwd) ? input.cwd : process.cwd()
+
+if (side === '--claude') {
+  const plan = input.tool_input?.plan
+  if (input.tool_name !== 'ExitPlanMode' || !plan) process.exit(0)
+  if (takeReviewedRound(input.session_id)) process.exit(0) // revised after this round's review
+  let review
+  try {
+    review = await codexReview(plan, cwd)
+  } catch (err) {
+    emit({ systemMessage: `Codex plan review unavailable (${err.message}); plan shown unreviewed.` })
+    process.exit(0)
+  }
+  if (isLgtm(review)) {
+    emit({ systemMessage: `Codex reviewed this plan: ${review.split('\n')[0]}` })
+    process.exit(0)
+  }
+  markReviewedRound(input.session_id)
+  emit({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason:
+        'Codex reviewed this plan before it goes to the user:\n\n' + review + '\n\n' +
+        'Revise the plan where Codex is right. Add a short "Codex review" section to the plan listing what you changed ' +
+        'and any points you disagree with and why. Then call ExitPlanMode again; it will not be reviewed a second time.',
+    },
+  })
+} else if (side === '--codex') {
+  if (input.stop_hook_active) process.exit(0) // already continued once for a review
+  const plan = extractProposedPlan(input.last_assistant_message)
+  if (!plan) process.exit(0)
+  let review
+  try {
+    review = await claudeReview(plan, cwd)
+  } catch (err) {
+    emit({ systemMessage: `Claude plan review unavailable (${err.message}); plan shown unreviewed.` })
+    process.exit(0)
+  }
+  if (isLgtm(review)) {
+    emit({ systemMessage: `Claude reviewed this plan: ${review.split('\n')[0]}` })
+    process.exit(0)
+  }
+  emit({
+    decision: 'block',
+    reason:
+      'Claude Code reviewed your proposed plan before it goes to the user:\n\n' + review + '\n\n' +
+      'Revise the plan where Claude is right, add a short "Claude review" section listing what you changed and any ' +
+      'points you disagree with and why, then present the updated plan in a <proposed_plan> block.',
+  })
+} else {
+  console.error('usage: plan-review --claude|--codex  (hook input on stdin)')
+  process.exit(2)
+}
