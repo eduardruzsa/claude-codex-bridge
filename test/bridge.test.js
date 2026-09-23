@@ -635,7 +635,11 @@ test('a channel without launch ownership preserves pending requests instead of d
     channelServer = await startClaude('wrong-owner', 'manual-conversation')
     await waitFor(() => fs.existsSync(sockFile('wrong-owner')))
     await new Promise(r => setTimeout(r, 800))
+    const { msg_id } = readPending('claude', 'wrong-owner').messages[0]
     assert.equal(readPending('claude', 'wrong-owner').messages[0].state, 'pending')
+    // Never claimed, not even briefly: a claim would be recorded in the transcript.
+    const { readTranscript } = await import('../lib/common.js')
+    assert.deepEqual(readTranscript().filter(e => e.msg_id === msg_id && e.event === 'claimed'), [])
     assert.equal(channelServer.notifications.filter(channel).length, 0)
   } finally { owner.kill(); await channelServer?.client.close() }
 })
