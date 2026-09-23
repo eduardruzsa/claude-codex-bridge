@@ -238,8 +238,17 @@ test('a second claude-live gets the next free label; an explicit label is never 
   fs.writeFileSync(pairsFile, JSON.stringify({ 'claude-7': { codex: T, claude_session: 'resumed', cwd } }), { mode: 0o600 })
   const resumed = await channel('claude-7', cwd, null, { explicit: false, session: 'resumed' })
   assert.match(await status(resumed), /label: claude-7 \(listening\)[\s\S]*pairing: Codex thread 11111111/)
+
+  // Lifecycle identity decides, not a stale CLAUDE_CODE_SESSION_ID, even when
+  // SessionStart arrives after the channel started.
+  fs.writeFileSync(pairsFile, JSON.stringify({ 'claude-8': { codex: U, claude_session: 'lifecycle-resumed', cwd } }), { mode: 0o600 })
+  const dir = path.join(tmp, 'late-lifecycle'); fs.mkdirSync(dir, { mode: 0o700 })
+  setTimeout(() => hook(dir, 'lifecycle-resumed', 'SessionStart', 'resume', cwd), 400)
+  const late = await channel('claude-8', cwd, dir, { explicit: false, session: 'stale-env-id' })
+  assert.match(await status(late), /label: claude-8 \(listening\)/)
+
   if (saved === null) fs.rmSync(pairsFile); else fs.writeFileSync(pairsFile, saved)
-  for (const c of [resumed, second, first]) await close(c)
+  for (const c of [late, resumed, second, first]) await close(c)
 })
 
 async function waitForText(read, pattern) {

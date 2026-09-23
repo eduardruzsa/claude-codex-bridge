@@ -54,9 +54,14 @@ const claudeProc = findClaudeProcess()
 const active = channelActive(claudeProc)
 // Plugin mode: the SessionStart/SessionEnd hooks keep this Claude process's
 // conversation id in a per-process directory. Adopt it once the hook created it.
-const pluginLifecycleDir = !process.env.CC_BRIDGE_LIFECYCLE_DIR && claudeProc && launchedWithChannel(claudeProc.args)
-  ? lifecycleDirFor(claudeProc)
-  : null
+let pluginLifecycleDir = null
+if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && claudeProc && launchedWithChannel(claudeProc.args)) {
+  try {
+    pluginLifecycleDir = lifecycleDirFor(claudeProc) // needs runtime_dir from the config
+  } catch (err) {
+    configError ||= err.message
+  }
+}
 function currentIdentity() {
   if (pluginLifecycleDir && !process.env.CC_BRIDGE_LIFECYCLE_DIR && fs.existsSync(pluginLifecycleDir)) {
     process.env.CC_BRIDGE_LIFECYCLE_DIR = pluginLifecycleDir
@@ -353,12 +358,26 @@ function acquireLabel(name) {
   })
 }
 
+// The conversation id to match pairings against when choosing a label: the lifecycle
+// state from SessionStart (authoritative, and right after a resume), waiting briefly
+// for the hook; CLAUDE_CODE_SESSION_ID only if no lifecycle state arrives.
+async function sessionForLabel(waitMs = 5000) {
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    const waitingForHook = pluginLifecycleDir && !fs.existsSync(pluginLifecycleDir)
+    const state = currentIdentity()
+    if (!waitingForHook && state.ready && state.session) return state.session
+    if (Date.now() > deadline) return state.session || process.env.CLAUDE_CODE_SESSION_ID || null
+    await new Promise(r => setTimeout(r, 100))
+  }
+}
+
 // Labels to try, in order. An explicit CC_BRIDGE_LABEL: only that one. Otherwise the
 // label paired with this conversation (so a resumed conversation gets its Codex
 // thread back), then the default, then default-2, default-3, ...
-function labelCandidates() {
+async function labelCandidates() {
   if (labelExplicit) return [label]
-  const session = process.env.CLAUDE_CODE_SESSION_ID
+  const session = await sessionForLabel()
   let paired = []
   try {
     paired = Object.entries(loadPairs()).filter(([, p]) => session && p.claude_session === session).map(([l]) => l)
@@ -408,7 +427,7 @@ async function bindLabel(name) {
 async function listen() {
   if (configError) throw new Error(configError)
   if (!process.env.CC_BRIDGE_LIFECYCLE_DIR && !pluginLifecycleDir && !currentIdentity().ready) throw new Error('CLAUDE_CODE_SESSION_ID is not set; launch through claude-live')
-  const candidates = labelCandidates()
+  const candidates = await labelCandidates()
   let sockPath = null
   let taken = null
   for (const name of candidates) {

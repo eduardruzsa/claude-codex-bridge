@@ -1,7 +1,7 @@
 // The config file: defaults, file values, env overrides, validation, and the places
 // that read it from outside Node (claude-live) or before anything else works.
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -126,6 +126,47 @@ test('a broken config file: the channel still starts and says why on every tool 
   } finally {
     await client.close()
   }
+})
+
+test('a broken config file in a real plugin session: found via the claude process, still no crash', async () => {
+  const file = withConfig('{ "runtime_dir": ')
+  // A parent process named "claude" started with the channel flag, as Claude Code
+  // would be; the channel finds it through /proc, so lifecycle lookup runs too.
+  const fakeClaude = path.join(tmp, 'claude')
+  fs.symlinkSync(process.execPath, fakeClaude)
+  const wrapper = path.join(tmp, 'wrapper.cjs')
+  fs.writeFileSync(wrapper, `const { spawn } = require('child_process')
+const c = spawn(process.execPath.replace(/claude$/, 'node'), [${JSON.stringify(path.join(root, 'claude-channel.js'))}], { stdio: 'inherit' })
+c.on('exit', code => process.exit(code ?? 1))`)
+  fs.symlinkSync(process.execPath, path.join(tmp, 'node'))
+  const client = new Client({ name: 'config-test', version: '0' })
+  await client.connect(new StdioClientTransport({
+    command: fakeClaude,
+    args: [wrapper, '--dangerously-load-development-channels', 'plugin:cc-bridge@cc-bridge'],
+    env: { PATH: process.env.PATH, HOME: tmp, CC_BRIDGE_CONFIG: file, CLAUDE_CODE_SESSION_ID: 's' },
+  }))
+  try {
+    const send = await client.callTool({ name: 'send_to_codex', arguments: { text: 'hi' } })
+    assert.equal(send.isError, true)
+    assert.match(send.content[0].text, /not listening: .*is not valid JSON/)
+  } finally {
+    await client.close()
+  }
+})
+
+test('concurrent config init and set lose nothing', async () => {
+  const file = withConfig()
+  const sets = [['claude_bin', '/a/claude'], ['codex_bin', '/b/codex'], ['max_exchange_depth', '7'], ['start_timeout_seconds', '99'], ['consult_timeout_seconds', '77']]
+  const run = args => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(root, 'bin', 'cc-bridge'), 'config', ...args], { env: { ...process.env, CC_BRIDGE_CONFIG: file }, stdio: ['ignore', 'ignore', 'pipe'] })
+    let err = ''
+    child.stderr.on('data', d => (err += d))
+    child.on('exit', code => (code === 0 ? resolve() : reject(new Error(err))))
+  })
+  await Promise.all([run(['init']), ...sets.map(([k, v]) => run(['set', k, v])), run(['init'])])
+  const values = loadConfig().values
+  for (const [k, v] of sets) assert.equal(String(values[k]), v, k)
+  assert.ok(!fs.existsSync(`${file}.lock`))
 })
 
 test('every documented key is in config.example.json; versions agree', () => {
