@@ -9,7 +9,7 @@ Optionally, each agent can also [review the other's plans](docs/configuration.md
 ## Requirements
 
 - Linux, Node **22.23.2** or newer, npm, Git, `flock` (util-linux)
-- Claude Code with Channels (tested with 2.1.280) and Codex with `codex queue` (tested with 0.156.1), both logged in
+- Claude Code with Channels and `--restricted` (tested with 2.1.280), and Codex with `codex queue` (tested with 0.156.1), both logged in
 - A terminal launcher: `xdg-terminal-exec`, or any terminal you [configure](docs/configuration.md)
 
 ## Install
@@ -17,17 +17,22 @@ Optionally, each agent can also [review the other's plans](docs/configuration.md
 ```sh
 git clone https://github.com/eduardruzsa/claude-codex-bridge.git
 cd claude-codex-bridge
+```
+
+If you don't have `xdg-terminal-exec`, tell the bridge which terminal to use first, or setup stops:
+
+```sh
+node bin/cc-bridge config set terminal '["kitty", "--directory", "{cwd}", "--title", "{title}"]'
+```
+
+Then:
+
+```sh
 npm run setup
 cc-bridge doctor
 ```
 
 Setup registers the bridge in Codex, installs the `cc-bridge` Claude plugin, and links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on your `PATH`). It is safe to run again and never overwrites anything that isn't its own. Keep the clone where it is, because Codex runs the bridge from there. Restart Codex afterwards.
-
-No `xdg-terminal-exec`? Set your terminal before setup:
-
-```sh
-node bin/cc-bridge config set terminal '["kitty", "--directory", "{cwd}", "--title", "{title}"]'
-```
 
 **Update:** `git pull && npm ci && cc-bridge install`, then restart Codex and Claude.
 
@@ -43,7 +48,9 @@ node bin/cc-bridge config set terminal '["kitty", "--directory", "{cwd}", "--tit
 default_tools_approval_mode = "approve"
 ```
 
-Without it, bridge calls are refused under approval policy `never` (and in `codex exec`). With `approvals_reviewer = "auto_review"`, the automatic reviewer may reject messages that mention your repository. Allowing the tools only lets Codex send and read bridge messages; the Claude on the other end still asks you before it edits anything or runs commands.
+This approves all of the bridge's tools: messaging, pairing, and `consult_claude`, which starts a separate read-only Claude and uses your Claude quota. To keep being asked before consultations, see [per-tool approval](docs/configuration.md#codex-tool-approval). The Claude on the other end still asks you before it edits anything or runs commands.
+
+Without it, bridge calls are refused under approval policy `never` (and in `codex exec`). With `approvals_reviewer = "auto_review"`, the automatic reviewer may reject messages that mention your repository.
 
 ## Use it
 
@@ -74,7 +81,7 @@ cc-bridge retry <message-id>  # restart a failed startup and hand the request ov
 - **Local and per-user.** Messages go over a Unix socket in a private (`0700`) directory, authenticated with a random token. Nothing listens on the network. Other users can't reach the bridge. Processes running as your own user (and root) can read the token and transcript and are trusted, just as they can read your agents' files.
 - **Identity comes from the hosts, not the model.** Codex identifies the calling thread through host metadata. Claude pairings bind to the exact conversation ID.
 - **No rerouting.** A message never moves to another conversation. After `/clear` or a switched conversation, waiting requests are recorded as dropped, not resent.
-- **Read-only helpers.** `consult_claude` and the plan reviewers can only read and search files, with no MCP servers. If the Codex reviewer can't be isolated, it doesn't run.
+- **Read-only helpers.** `consult_claude` and the Claude plan reviewer run `claude -p --restricted` with only Read, Grep and Glob, and no MCP servers. The Codex plan reviewer runs `codex exec` in a read-only sandbox (it can run shell commands but not write) with hooks, plugins, apps and every MCP server disabled. If it can't be isolated, it doesn't run.
 
 ## Uninstall
 

@@ -29,6 +29,19 @@ Changes apply on the next action. Restart the agents after changing `claude_bin`
 
 The consultation and plan-reviewer tool restrictions are deliberately not configurable; see the Security model in the [README](../README.md#security-model).
 
+## Codex tool approval
+
+Codex asks before every MCP tool call. Setting `default_tools_approval_mode = "approve"` on the `cc-bridge` entry in `~/.codex/config.toml` approves all of the bridge's tools. To keep one tool on prompt, for example `consult_claude`, which starts a separate Claude and uses your Claude quota, override it:
+
+```toml
+[mcp_servers.cc-bridge]
+# command and args as written by setup
+default_tools_approval_mode = "approve"
+
+[mcp_servers.cc-bridge.tools.consult_claude]
+approval_mode = "prompt"
+```
+
 ## Plan review
 
 When enabled, the other agent reviews a plan before it reaches you:

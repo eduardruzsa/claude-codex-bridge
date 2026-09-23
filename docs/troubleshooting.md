@@ -56,6 +56,8 @@ cc-bridge unpair --claude review
 - **Codex:** `list_sessions`, `connect_claude(project_dir, session?)`, `send_to_claude`, `reply`, `bridge_status`, `pair_with_claude`, `consult_claude`, `list_consultations`
 - **Claude:** `send_to_codex`, `reply`, `bridge_status`
 
+Each message accepts one reply. To follow up, reply to the reply you received, or start a new message. An exchange is capped at `max_exchange_depth` messages.
+
 An explicit session selection can replace a pairing, so the agents are instructed to ask before choosing among candidates or changing a connection.
 
 `consult_claude` asks a separate, read-only Claude (Read/Grep/Glob only) instead of the live session. It uses your Claude quota.
