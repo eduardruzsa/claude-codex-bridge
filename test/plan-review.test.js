@@ -16,6 +16,11 @@ const calls = path.join(tmp, 'calls.jsonl')
 // Fake reviewers: reply with $FAKE_REVIEW (or fail when it is "FAIL"), log how they were called.
 const log = `require('fs').appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), guard: process.env.CC_BRIDGE_PLAN_REVIEW, prompt: input }) + '\\n')`
 fs.writeFileSync(path.join(tmp, 'codex'), `#!/usr/bin/env node
+if (process.argv[2] === 'mcp') {
+  if (process.env.FAKE_REVIEW === 'NOLIST') process.exit(1)
+  const odd = process.env.FAKE_REVIEW === 'ODDNAME' ? [{ name: 'odd.name' }] : []
+  console.log(JSON.stringify([{ name: 'serena' }, { name: 'cc-bridge' }, ...odd])); process.exit(0)
+}
 let input = ''; process.stdin.on('data', d => (input += d)).on('end', () => {
   ${log}
   if (process.env.FAKE_REVIEW === 'FAIL') { console.error('boom'); process.exit(3) }
@@ -50,7 +55,10 @@ test('Claude plan: Codex findings send it back once; the revised plan passes; th
   assert.equal(first.hookSpecificOutput.permissionDecision, 'deny')
   assert.match(first.hookSpecificOutput.permissionDecisionReason, /Codex reviewed this plan[\s\S]*step 2 misses the migration[\s\S]*call ExitPlanMode again/)
   const call = lastCall()
-  assert.deepEqual(call.args.slice(0, 6), ['exec', '--sandbox', 'read-only', '--ephemeral', '--skip-git-repo-check', '-C'])
+  // Isolated: hooks/plugins/apps off and every configured MCP server disabled, then read-only.
+  assert.deepEqual(call.args.slice(0, 11), ['exec', '--disable', 'hooks', '--disable', 'plugins', '--disable', 'apps',
+    '-c', 'mcp_servers.serena.enabled=false', '-c', 'mcp_servers.cc-bridge.enabled=false'])
+  assert.deepEqual(call.args.slice(11, 16), ['--sandbox', 'read-only', '--ephemeral', '--skip-git-repo-check', '-C'])
   assert.equal(call.cwd, fs.realpathSync(tmp))
   assert.equal(call.guard, '0', 'reviewer runs with plan review off')
   assert.match(call.prompt, /Claude Code wrote[\s\S]*1\. Do X/)
@@ -63,6 +71,11 @@ test('Claude plan: Codex findings send it back once; the revised plan passes; th
 test('Claude plan: LGTM and reviewer failure pass with a visible note', () => {
   assert.match(hook('--claude', exitPlan('s3'), 'LGTM\n- minor: name things').systemMessage, /^Codex reviewed this plan: LGTM/)
   assert.match(hook('--claude', exitPlan('s3'), 'FAIL').systemMessage, /Codex plan review unavailable/)
+  // If the MCP servers can't be listed (so not disabled), the reviewer doesn't run at all.
+  const before = fs.readFileSync(calls, 'utf8')
+  assert.match(hook('--claude', exitPlan('s3'), 'NOLIST').systemMessage, /unavailable \(cannot list Codex MCP servers/)
+  assert.match(hook('--claude', exitPlan('s3'), 'ODDNAME').systemMessage, /unavailable \(cannot disable Codex MCP server\(s\) odd\.name/)
+  assert.equal(fs.readFileSync(calls, 'utf8'), before)
   assert.equal(hook('--claude', { ...exitPlan('s3'), tool_name: 'Bash' }), null)
 })
 

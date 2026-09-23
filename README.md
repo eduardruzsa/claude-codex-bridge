@@ -53,7 +53,9 @@ Before a plan reaches you, the other agent reviews it. This works in every sessi
 - Each review takes about a minute or two and uses the other agent's normal usage.
 - Turn it off for a session with `CC_BRIDGE_PLAN_REVIEW=0`.
 
-`cc-bridge install` adds the Codex `Stop` hook to `~/.codex/hooks.json`, keeping your other hooks. The Claude hook ships in the plugin. **Codex asks you once to trust the new hook** ("hooks need review") the next time you open it; until you do, Codex plans go unreviewed.
+`cc-bridge install` adds the Codex `Stop` hook to `~/.codex/hooks.json`, keeping your other hooks. The Claude hook ships in the plugin. **Codex asks you once to trust the new hook** ("hooks need review", or run `/hooks`) the next time you open it. Until you do, Codex plans go unreviewed; `cc-bridge doctor` shows the trust status as Codex reports it.
+
+The Codex reviewer runs isolated: read-only sandbox, with hooks, plugins, apps and every configured MCP server turned off. If it can't be isolated, it doesn't run. The Claude reviewer runs with `--restricted` and read/search tools only.
 
 ## Reconnecting
 

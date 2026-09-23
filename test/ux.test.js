@@ -6,7 +6,7 @@ import { spawnSync, execFileSync } from 'node:child_process'
 import { after, test } from 'node:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { install, minimumNode, supportedNode, root } from '../lib/admin.js'
+import { install, minimumNode, supportedNode, root, shQuote } from '../lib/admin.js'
 import { transition } from '../lib/lifecycle.js'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
@@ -73,7 +73,13 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   const stop = JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command))
   assert.equal(stop.length, 2)
   assert.equal(stop[0], 'keep-me')
-  assert.match(stop[1], /bin\/plan-review" --codex$/)
+  assert.match(stop[1], /bin\/plan-review' --codex$/)
+  // Reinstalling after a quoting change replaces the old entry instead of adding one.
+  const legacy = JSON.parse(fs.readFileSync(hooksFile, 'utf8'))
+  legacy.hooks.Stop[1].hooks[0].command = '"/usr/bin/node" "/old/checkout/bin/plan-review" --codex'
+  fs.writeFileSync(hooksFile, JSON.stringify(legacy))
+  install({ home })
+  assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks).length, 2)
   assert.equal(JSON.parse(first).other.command, 'preserve-me')
   assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
   const conflictingHome = path.join(tmp, 'conflict')
@@ -192,4 +198,9 @@ test('running channel refreshes lifecycle identity; changed conversations cannot
   hook(dir, 'B', 'SessionStart', 'resume', cwd)
   assert.equal((await connectClaude(T, cwd)).pair.claude_session, 'B')
   await unpair('lifecycle'); await close(c)
+})
+
+test('hook commands are single-quoted so nothing in a path is expanded', () => {
+  const nasty = "/tmp/a $(printf EXPANDED) `printf TICK` $HOME it's"
+  assert.equal(execFileSync('sh', ['-c', `printf %s ${shQuote(nasty)}`], { encoding: 'utf8' }), nasty)
 })
