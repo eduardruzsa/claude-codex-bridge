@@ -43,6 +43,18 @@ CC_BRIDGE_LABEL=review claude-live
 
 Matching uses the canonical Git working-tree root, or the canonical working directory outside Git. Subdirectories and symlinks match the same project; separate Git worktrees stay separate. You may explicitly select a conversation in another project.
 
+## Plan review
+
+Before a plan reaches you, the other agent reviews it. This works in every session, not only `claude-live`:
+
+- **Claude Code plan mode:** when Claude calls `ExitPlanMode`, a read-only `codex exec` reviews the plan. If Codex has findings, Claude revises the plan once, adds a short "Codex review" section (what changed, and where it disagrees), and presents it.
+- **Codex plan mode:** when Codex ends a turn with a `<proposed_plan>`, a restricted read-only `claude -p` reviews it. Codex then revises the plan in the same way, adding a "Claude review" section.
+- "LGTM" passes straight through with a note. A reviewer failure never blocks: the plan passes with a warning.
+- Each review takes about a minute or two and uses the other agent's normal usage.
+- Turn it off for a session with `CC_BRIDGE_PLAN_REVIEW=0`.
+
+`cc-bridge install` adds the Codex `Stop` hook to `~/.codex/hooks.json`, keeping your other hooks. The Claude hook ships in the plugin. **Codex asks you once to trust the new hook** ("hooks need review") the next time you open it; until you do, Codex plans go unreviewed.
+
 ## Reconnecting
 
 - Resuming the **same conversation** preserves its pairing.
