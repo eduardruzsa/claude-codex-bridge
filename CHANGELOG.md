@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Requests for an agent that is still starting get an id and timestamp at once, and survive a slow approval, an interrupted handover or a closed window. After a conversation change they are recorded as dropped, never rerouted.
+- One window per startup: the launch is reserved before the terminal opens and tracked by a wrapper inside it, so a slow start no longer opens a second window.
+- `cc-bridge status` shows waiting requests and their age (`--verbose` for full ids). New `cc-bridge retry <id>` and `cc-bridge cancel <id>`.
+- Delivery states say what is known: "queued to Codex", and "notification sent; receipt unconfirmed" for Claude until a real reply.
+- `pair_with_claude` hands over pending messages like `connect_claude`.
+
 ## 0.4.1
 
 - An agent started by the bridge no longer inherits the starting agent's session environment. A Codex opened from Claude used to receive `CLAUDE_PROJECT_DIR`, Claude's session ids and its messaging token, which made Codex hooks behave as if they ran under Claude.
