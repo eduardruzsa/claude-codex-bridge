@@ -4,13 +4,14 @@ Let Claude Code and OpenAI Codex talk to each other on your machine. Say *"ask C
 
 Optionally, each agent can also [review the other's plans](docs/configuration.md#plan-review) before you see them.
 
-> **Status:** Linux only. It relies on Claude Channels, which are a research preview in Claude Code.
+> **Platforms:** Linux and macOS. It relies on Claude Channels, which are a research preview in Claude Code.
 
 ## Requirements
 
-- Linux, Node **22.23.2** or newer, npm, Git, `flock` (util-linux)
+- Linux or macOS, Node **22.23.2** or newer, npm, Git
+- macOS: Xcode Command Line Tools (`xcode-select --install`), used to build the small native process/locking helper on first use
 - Claude Code with Channels and `--restricted` (tested with 2.1.280), and Codex with `codex queue` (tested with 0.156.1), both logged in
-- A terminal launcher: `xdg-terminal-exec`, or any terminal you [configure](docs/configuration.md)
+- A terminal launcher: Terminal.app on macOS; `xdg-terminal-exec` on Linux; or any terminal you [configure](docs/configuration.md)
 
 ## Install
 
@@ -19,11 +20,13 @@ git clone https://github.com/eduardruzsa/claude-codex-bridge.git
 cd claude-codex-bridge
 ```
 
-If you don't have `xdg-terminal-exec`, tell the bridge which terminal to use first, or setup stops:
+On Linux, if you don't have `xdg-terminal-exec`, tell the bridge which terminal to use first, or setup stops:
 
 ```sh
 node bin/cc-bridge config set terminal '["kitty", "--directory", "{cwd}", "--title", "{title}"]'
 ```
+
+On macOS, Terminal.app is the default; no terminal configuration is needed. macOS may ask you to allow your terminal or agent app to control Terminal.app when the bridge opens its first window.
 
 Then:
 
@@ -32,7 +35,7 @@ npm run setup
 cc-bridge doctor
 ```
 
-Setup registers the bridge in Codex, installs the `cc-bridge` Claude plugin, and links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on your `PATH`). It is safe to run again and never overwrites anything that isn't its own. Keep the clone where it is, because Codex runs the bridge from there. Restart Codex afterwards.
+Setup registers the bridge in Codex, installs the `cc-bridge` Claude plugin and Codex plan-review hook, and links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on your `PATH`). Plan reviews are off by default; [enable them and trust the Codex hook](docs/configuration.md#plan-review) when you want to use them. It is safe to run setup again and never overwrites anything that isn't its own. Keep the clone where it is, because Codex runs the bridge from there. Restart Codex afterwards.
 
 **Update:** `git pull && npm ci && cc-bridge install`, then restart Codex and Claude.
 

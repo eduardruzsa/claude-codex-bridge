@@ -9,7 +9,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { install, minimumNode, supportedNode, root, shQuote, uninstall } from '../lib/admin.js'
 import { transition } from '../lib/lifecycle.js'
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-ux-'))
 process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
 process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
 process.env.CC_BRIDGE_CLAUDE_PROC = 'none' // isolate from the Claude session running the tests
@@ -75,8 +75,8 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   const hooksFile = path.join(home, '.codex', 'hooks.json')
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
-  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
-  install({ home })
+  fs.rmSync(process.env.CC_BRIDGE_CONFIG, { force: true })
+  const message = install({ home })
   const first = fs.readFileSync(config, 'utf8')
   install({ home })
   assert.equal(fs.readFileSync(config, 'utf8'), first)
@@ -85,16 +85,31 @@ test('installer is repeatable, preserves other servers and rejects conflicts bef
   assert.equal(stop.length, 2)
   assert.equal(stop[0], 'keep-me')
   assert.match(stop[1], /bin\/plan-review' --codex$/)
+  assert.match(message, /hook installed/i)
   // Reinstalling after a quoting change replaces the old entry instead of adding one.
   const legacy = JSON.parse(fs.readFileSync(hooksFile, 'utf8'))
   legacy.hooks.Stop[1].hooks[0].command = '"/usr/bin/node" "/old/checkout/bin/plan-review" --codex'
   fs.writeFileSync(hooksFile, JSON.stringify(legacy))
   install({ home })
   assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks).length, 2)
-  // Turning Codex plan review off and reinstalling removes only our hook.
+  // Enabling or disabling review never changes the installed hook or its trust hash.
+  const installedHook = fs.readFileSync(hooksFile, 'utf8')
+  const enabled = spawnSync(process.execPath, [path.join(root, 'bin/cc-bridge'), 'config', 'set', 'plan_review.review_codex_plans', 'true'], {
+    encoding: 'utf8', env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex') },
+  })
+  assert.equal(enabled.status, 0, enabled.stderr)
+  assert.match(enabled.stdout, /Trust.*Stop hook[\s\S]*No reinstall needed/)
+  install({ home })
+  assert.equal(fs.readFileSync(hooksFile, 'utf8'), installedHook)
   fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: false } }))
   install({ home })
-  assert.deepEqual(JSON.parse(fs.readFileSync(hooksFile, 'utf8')).hooks.Stop.flatMap(g => g.hooks.map(h => h.command)), ['keep-me'])
+  assert.equal(fs.readFileSync(hooksFile, 'utf8'), installedHook)
+  const diagnosed = spawnSync(process.execPath, [path.join(root, 'bin/cc-bridge'), 'doctor'], {
+    encoding: 'utf8', env: { ...process.env, HOME: home, CODEX_HOME: path.join(home, '.codex') }, timeout: 10000,
+  })
+  assert.match(diagnosed.stdout, /OK Codex plan-review hook/)
+  assert.match(diagnosed.stdout, /reviews disabled/)
+  assert.doesNotMatch(diagnosed.stdout, /hook trusted|install to remove it/)
   assert.equal(JSON.parse(first).other.command, 'preserve-me')
   assert.equal(fs.readlinkSync(path.join(home, '.local/bin/claude-live')), path.join(root, 'bin/claude-live'))
   const conflictingHome = path.join(tmp, 'conflict')
@@ -116,7 +131,7 @@ test('uninstall removes only what is ours; --purge spares unrelated files', () =
   const hooksFile = path.join(home, '.codex', 'hooks.json')
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true })
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'keep-me' }] }] } }))
-  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: true } }))
+  fs.writeFileSync(process.env.CC_BRIDGE_CONFIG, JSON.stringify({ plan_review: { review_codex_plans: false } }))
   install({ home })
   const data = process.env.CC_BRIDGE_DATA_DIR
   fs.writeFileSync(path.join(data, 'token'), 'x')

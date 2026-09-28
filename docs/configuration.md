@@ -12,12 +12,12 @@ cc-bridge config set <key> <value>
 |---|---|---|---|
 | `claude_bin` | `"claude"` | Claude Code command | `CC_BRIDGE_CLAUDE_BIN` |
 | `codex_bin` | `"codex"` | Codex command | `CC_BRIDGE_CODEX_BIN` |
-| `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses `xdg-terminal-exec` | `CC_BRIDGE_TERMINAL` (space-separated) |
+| `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses Terminal.app on macOS and `xdg-terminal-exec` on Linux | `CC_BRIDGE_TERMINAL` (space-separated) |
 | `default_label` | `"claude"` | Label of a `claude-live` session; when taken, the next free `<label>-2`, `<label>-3`, … is used | `CC_BRIDGE_LABEL` (exact label, no fallback) |
 | `data_dir` | `null` | Pairings, transcript, token; use a directory only the bridge uses. `null`: `~/.local/share/cc-bridge` | `CC_BRIDGE_DATA_DIR` |
-| `runtime_dir` | `null` | Sockets and launch state; use a directory only the bridge uses. `null`: `$XDG_RUNTIME_DIR/cc-bridge` | `CC_BRIDGE_RUNTIME_DIR` |
+| `runtime_dir` | `null` | Sockets and launch state; use a directory only the bridge uses. `null`: `$XDG_RUNTIME_DIR/cc-bridge` on Linux, `~/Library/Caches/cc-bridge` on macOS | `CC_BRIDGE_RUNTIME_DIR` |
 | `plan_review.review_claude_plans` | `false` | Codex reviews Claude's plans | `CC_BRIDGE_PLAN_REVIEW=0/1` |
-| `plan_review.review_codex_plans` | `false` | Claude reviews Codex's plans (run `cc-bridge install` after changing) | `CC_BRIDGE_PLAN_REVIEW=0/1` |
+| `plan_review.review_codex_plans` | `false` | Claude reviews Codex's plans (trust the installed hook in Codex `/hooks`) | `CC_BRIDGE_PLAN_REVIEW=0/1` |
 | `plan_review.timeout_seconds` | `480` | Longest a plan review may take (max 540) | |
 | `start_timeout_seconds` | `180` | How long before a startup is shown as waiting; never opens another window | |
 | `consult_timeout_seconds` | `600` | Longest a `consult_claude` call may take | |
@@ -56,9 +56,28 @@ To turn it on:
 ```sh
 cc-bridge config set plan_review.review_claude_plans true
 cc-bridge config set plan_review.review_codex_plans true
-cc-bridge install        # adds the Codex Stop hook
 ```
 
-The Claude hook ships in the plugin and follows the config right away. The Codex side needs a `Stop` hook in `~/.codex/hooks.json`, which `cc-bridge install` adds only while `review_codex_plans` is on (and removes when it is off). Codex asks you once to trust the new hook ("hooks need review", or run `/hooks`); until then, Codex plans go unreviewed. `cc-bridge doctor` shows the trust status.
+Setup installs both hooks: the Claude hook ships in the plugin, and `cc-bridge install` always adds the Codex `Stop` hook to `~/.codex/hooks.json`. Both read the review settings on each invocation, so enabling or disabling review needs no reinstall. The disabled hook exits without calling a reviewer or using model quota. `cc-bridge uninstall` removes the Codex hook.
 
-`CC_BRIDGE_PLAN_REVIEW=0` or `=1` overrides the config for one session, but `=1` can't activate a Codex hook that isn't installed.
+Codex asks you to trust the hook ("hooks need review", or run `/hooks`). Until it is trusted, Codex skips it even when review is enabled. New or changed hook definitions need trust again. `cc-bridge doctor` checks installation and shows whether reviews are enabled; it checks trust when Codex review is enabled. If you installed an older bridge version without the hook, run `cc-bridge install` once after updating.
+
+`CC_BRIDGE_PLAN_REVIEW=0` or `=1` overrides the config for one session. Codex still requires the hook to be installed and trusted.
+
+## macOS
+
+The first run compiles `native/macos.c` into the clone's ignored `.native/` directory using `/usr/bin/cc`. Install Apple's Command Line Tools with `xcode-select --install` first. The helper reads precise process start times and open rollout files with libproc, and argv with sysctl; it never uses a shell to parse process arguments. Kernel `flock` locks release when their helper exits, including when the owning Node process is killed. Lock files remain in private directories and must not be deleted while the bridge runs.
+
+Terminal.app is the default launcher. Allow the launching app to control Terminal.app in System Settings → Privacy & Security → Automation when macOS prompts. A denied request is recorded as a failed launch; after granting access, use `cc-bridge retry <message-id>`. Custom terminal argv works on both platforms.
+
+To use Ghostty for launches in both directions:
+
+```sh
+cc-bridge config set terminal '["/usr/bin/open","-na","/Applications/Ghostty.app","--args","--working-directory={cwd}","--title={title}","--quit-after-last-window-closed=true","-e"]'
+cc-bridge config set claude_bin "$(command -v claude)"
+cc-bridge config set codex_bin "$(command -v codex)"
+```
+
+The bridge appends the agent command after `-e`. Ghostty receives its own environment from macOS, so use executable paths for both agents and ensure `node` is on Ghostty's `PATH`. Custom shell environment variables may need separate configuration. `open` returns before the agent starts; check `cc-bridge status` to confirm the connection.
+
+The default socket directory is `~/Library/Caches/cc-bridge`, with user-only permissions. It isn't under `/tmp` or `TMPDIR`: macOS deletes files there after three days unused, including lock files that a long-running session still holds, and `TMPDIR` can differ between Claude and Codex. Socket paths must fit macOS's 103-byte limit (including the label and `.sock`). With a long user name and a long label, set `runtime_dir` to a shorter private directory.
