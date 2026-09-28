@@ -7,6 +7,8 @@
 #include <libproc.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <time.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,13 +64,28 @@ static void files(int pid) {
   free(fds);
 }
 
-static int lock_file(const char *path) {
+static long long now_ms(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+}
+
+static int lock_file(const char *path, int wait_ms) {
   int fd = open(path, O_CREAT | O_RDWR | O_NOFOLLOW, 0600);
   if (fd < 0) return 1;
   struct stat st;
   if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid()) return 1;
   if (fchmod(fd, 0600)) return 1;
-  if (flock(fd, LOCK_EX | LOCK_NB)) return errno == EWOULDBLOCK ? 75 : 1;
+  // Wait here rather than being respawned per retry. Sleeping in poll on stdin
+  // also ends the wait at once if the parent dies.
+  long long deadline = now_ms() + (wait_ms > 0 ? wait_ms : 0);
+  while (flock(fd, LOCK_EX | LOCK_NB)) {
+    if (errno != EWOULDBLOCK) return 1;
+    long long left = deadline - now_ms();
+    if (left <= 0) return 75;
+    struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+    if (poll(&p, 1, left < 10 ? (int)left : 10) > 0) return 1;
+  }
   puts("locked");
   fflush(stdout);
   // The parent's pipe closes even on SIGKILL. Never unlink a lock inode.
@@ -83,7 +100,7 @@ static int lock_file(const char *path) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 3 && !strcmp(argv[1], "lock")) return lock_file(argv[2]);
+  if ((argc == 3 || argc == 4) && !strcmp(argv[1], "lock")) return lock_file(argv[2], argc == 4 ? atoi(argv[3]) : 0);
   if (argc == 3 && !strcmp(argv[1], "info")) return info(atoi(argv[2]));
   if (argc == 3 && !strcmp(argv[1], "files")) {
     int pid = atoi(argv[2]);

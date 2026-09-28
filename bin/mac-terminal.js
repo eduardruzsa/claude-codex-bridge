@@ -6,7 +6,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { runtimeDir } from '../lib/common.js'
 import { agentEnv } from '../lib/launch.js'
-import { terminalScript, terminalShellCommand } from '../lib/mac-terminal.js'
+import { awaitHandoff, terminalScript, terminalShellCommand } from '../lib/mac-terminal.js'
 
 if (process.argv[2] === '--run') {
   const file = process.argv[3]
@@ -31,5 +31,9 @@ if (process.argv[2] === '--run') {
   const child = spawn('/usr/bin/osascript', ['-e', terminalScript, terminalShellCommand(file), title], { stdio: ['ignore', 'ignore', 'inherit'] })
   const cleanup = () => { fs.rmSync(dir, { recursive: true, force: true }) }
   child.once('error', err => { cleanup(); console.error(err.message); process.exitCode = 1 })
-  child.once('exit', code => { if (code !== 0) cleanup(); process.exitCode = code ?? 1 })
+  child.once('exit', async code => {
+    if (code !== 0) { cleanup(); process.exitCode = code ?? 1; return }
+    // A nonzero exit marks the launch failed; the launcher is detached, so waiting is free.
+    if (!(await awaitHandoff(dir))) { console.error('Terminal.app did not start the agent; launch request removed.'); process.exitCode = 1 }
+  })
 }

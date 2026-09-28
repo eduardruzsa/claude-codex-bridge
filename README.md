@@ -9,7 +9,6 @@ Optionally, each agent can also [review the other's plans](docs/configuration.md
 ## Requirements
 
 - Linux or macOS, Node **22.23.2** or newer, npm, Git
-- Linux: `flock` (util-linux)
 - macOS: Xcode Command Line Tools (`xcode-select --install`), used to build the small native process/locking helper on first use
 - Claude Code with Channels and `--restricted` (tested with 2.1.280), and Codex with `codex queue` (tested with 0.156.1), both logged in
 - A terminal launcher: Terminal.app on macOS; `xdg-terminal-exec` on Linux; or any terminal you [configure](docs/configuration.md)

@@ -109,3 +109,48 @@ test('terminal shell command quotes executable and request paths', async () => {
   assert.equal(r.status, 0, r.stderr)
   assert.deepEqual(r.stdout.trimEnd().split('\n').slice(-2), ['--run', request])
 })
+
+test('a symlinked data directory owned by this user is accepted', () => {
+  const real = fs.mkdtempSync(path.join(tmp, 'real-data-'))
+  const link = path.join(tmp, 'linked-data')
+  fs.symlinkSync(real, link)
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', "import { paths } from './lib/common.js'; console.log(paths.pairs())"],
+    { cwd: root, env: { ...process.env, CC_BRIDGE_DATA_DIR: link }, encoding: 'utf8' })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(r.stdout.trim(), path.join(link, 'pairs.json'))
+})
+
+test('the default macOS runtime directory is outside the /tmp cleaner', { skip: process.platform !== 'darwin' }, () => {
+  const home = fs.mkdtempSync(path.join(tmp, 'home-'))
+  const env = { ...process.env, HOME: home }
+  delete env.CC_BRIDGE_RUNTIME_DIR
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', "import { runtimeDir } from './lib/common.js'; console.log(runtimeDir())"],
+    { cwd: root, env, encoding: 'utf8' })
+  assert.equal(r.status, 0, r.stderr)
+  assert.equal(r.stdout.trim(), path.join(home, 'Library', 'Caches', 'cc-bridge'))
+})
+
+test('the macOS lock helper waits for a held lock in one process', { skip: process.platform !== 'darwin' }, async () => {
+  const name = `\0ccb-wait-${process.pid}`
+  const dir = path.join(tmp, 'wait-locks')
+  const held = await acquireMutex(name, dir)
+  setTimeout(() => held.close(), 300)
+  const started = Date.now()
+  const lock = await acquireMutex(name, dir, 3000)
+  assert.ok(Date.now() - started >= 250)
+  await new Promise(r => lock.close(r))
+  const busy = await acquireMutex(name, dir)
+  await assert.rejects(acquireMutex(name, dir, 100), e => e.code === 'EADDRINUSE')
+  await new Promise(r => busy.close(r))
+})
+
+test('an unconsumed terminal launch request is removed after the handoff window', async () => {
+  const { awaitHandoff } = await import('../lib/mac-terminal.js')
+  const dir = fs.mkdtempSync(path.join(tmp, 'terminal-'))
+  fs.writeFileSync(path.join(dir, 'request.json'), '{}', { mode: 0o600 })
+  assert.equal(await awaitHandoff(dir, 200), false)
+  assert.equal(fs.existsSync(dir), false)
+  const consumed = fs.mkdtempSync(path.join(tmp, 'terminal-'))
+  setTimeout(() => fs.rmSync(consumed, { recursive: true }), 100)
+  assert.equal(await awaitHandoff(consumed, 5000), true)
+})

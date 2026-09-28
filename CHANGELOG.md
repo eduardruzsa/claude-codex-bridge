@@ -5,6 +5,8 @@
 - Add macOS support with native process identity and open-file checks, kernel-held locks, and Terminal.app launching. Requires Xcode Command Line Tools on first use.
 - Keep bridge socket paths short on macOS and remove the GNU `readlink` requirement.
 - Run the test suite on Linux and macOS with Node 22 and the latest LTS.
+- On macOS, keep runtime state in `~/Library/Caches/cc-bridge` instead of `/tmp`, where files unused for three days (including held lock files) are deleted. Accept symlinked data and runtime directories. Sessions without Xcode Command Line Tools stay dormant instead of failing, and unstarted Terminal.app launch requests are removed after a minute.
+- Serialize lifecycle hook updates with the same kernel-held mutex on both platforms; Linux no longer needs util-linux `flock`.
 - Install the Codex plan-review hook during every setup. Reviews remain opt-in, and toggling them no longer needs reinstalling; Codex still requires hook trust before review can run. Document Ghostty configuration for macOS.
 
 
