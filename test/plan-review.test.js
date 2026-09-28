@@ -176,3 +176,28 @@ test('CC_BRIDGE_PLAN_REVIEW=0 disables both hooks', () => {
     assert.equal(r.stdout, '')
   }
 })
+
+test('an installed Codex hook stays idle by default and follows config changes without reinstalling', () => {
+  const toggleConfig = path.join(tmp, 'toggle.json')
+  const input = { cwd: tmp, last_assistant_message: '<proposed_plan>Check the installation</proposed_plan>' }
+  const run = () => spawnSync(process.execPath, [path.join(root, 'bin', 'plan-review'), '--codex'], {
+    input: JSON.stringify(input), encoding: 'utf8',
+    env: { ...baseEnv, CC_BRIDGE_CONFIG: toggleConfig, FAKE_REVIEW: 'LGTM' },
+  })
+  const before = fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : ''
+  for (const settings of [null, { plan_review: { review_codex_plans: false } }]) {
+    if (settings) fs.writeFileSync(toggleConfig, JSON.stringify(settings))
+    const r = run()
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.stdout, '')
+    assert.equal(fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '', before, 'disabled hook never calls a reviewer')
+  }
+  fs.writeFileSync(toggleConfig, JSON.stringify({ plan_review: { review_codex_plans: true } }))
+  const enabled = run()
+  assert.equal(enabled.status, 0, enabled.stderr)
+  assert.match(JSON.parse(enabled.stdout).systemMessage, /Claude reviewed this plan: LGTM/)
+  const reviewed = fs.readFileSync(calls, 'utf8')
+  fs.writeFileSync(toggleConfig, JSON.stringify({ plan_review: { review_codex_plans: false } }))
+  assert.equal(run().stdout, '')
+  assert.equal(fs.readFileSync(calls, 'utf8'), reviewed)
+})

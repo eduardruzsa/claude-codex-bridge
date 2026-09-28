@@ -5,6 +5,7 @@
 - Add macOS support with native process identity and open-file checks, kernel-held locks, and Terminal.app launching. Requires Xcode Command Line Tools on first use.
 - Keep bridge socket paths short on macOS and remove the GNU `readlink` requirement.
 - Run the test suite on Linux and macOS with Node 22 and the latest LTS.
+- Install the Codex plan-review hook during every setup. Reviews remain opt-in, and toggling them no longer needs reinstalling; Codex still requires hook trust before review can run. Document Ghostty configuration for macOS.
 
 
 ## 0.5.0 — first public release

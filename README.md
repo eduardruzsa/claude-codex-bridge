@@ -36,7 +36,7 @@ npm run setup
 cc-bridge doctor
 ```
 
-Setup registers the bridge in Codex, installs the `cc-bridge` Claude plugin, and links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on your `PATH`). It is safe to run again and never overwrites anything that isn't its own. Keep the clone where it is, because Codex runs the bridge from there. Restart Codex afterwards.
+Setup registers the bridge in Codex, installs the `cc-bridge` Claude plugin and Codex plan-review hook, and links `claude-live` and `cc-bridge` into `~/.local/bin` (make sure it's on your `PATH`). Plan reviews are off by default; [enable them and trust the Codex hook](docs/configuration.md#plan-review) when you want to use them. It is safe to run setup again and never overwrites anything that isn't its own. Keep the clone where it is, because Codex runs the bridge from there. Restart Codex afterwards.
 
 **Update:** `git pull && npm ci && cc-bridge install`, then restart Codex and Claude.
 

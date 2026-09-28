@@ -82,7 +82,7 @@ switch (cmd) {
         console.log(JSON.stringify(loadConfig().values[key]))
       } else if (sub === 'set' && key && value !== undefined) {
         console.log(`${key} = ${JSON.stringify(setConfig(key, value))} in ${configPath()}`)
-        if (key === 'plan_review.review_codex_plans') console.log('Run cc-bridge install to add or remove the Codex plan-review hook.')
+        if (key === 'plan_review.review_codex_plans' && loadConfig().values[key]) console.log('Trust the installed cc-bridge Stop hook in Codex /hooks before using plan review. No reinstall needed.')
         console.log('Running agents pick most changes up on their next action; restart them for claude_bin, data_dir or runtime_dir.')
       } else if (!sub) {
         const { file, exists, values, sources, warnings } = loadConfig()
