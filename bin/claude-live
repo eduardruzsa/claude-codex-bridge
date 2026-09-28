@@ -6,7 +6,7 @@
 claude="$CC_BRIDGE_CLAUDE_BIN"
 if [ -z "$claude" ]; then
   # claude_bin from ~/.config/cc-bridge/config.json; plain `claude` if unset or unreadable.
-  root="$(dirname "$(readlink -f "$0")")/.."
+  root="$(node -e 'const fs=require("fs"),path=require("path"); console.log(path.dirname(fs.realpathSync(process.argv[1])))' "$0")/.."
   claude="$(node "$root/lib/config.js" get claude_bin)" || claude=claude
 fi
 case "$1" in

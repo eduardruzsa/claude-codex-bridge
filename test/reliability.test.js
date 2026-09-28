@@ -5,7 +5,7 @@ import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { test, after } from 'node:test'
 const root = path.resolve(import.meta.dirname, '..')
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-reliability-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-reliability-'))
 Object.assign(process.env, { CC_BRIDGE_DATA_DIR: path.join(tmp, 'data'), CC_BRIDGE_RUNTIME_DIR: path.join(tmp, 'run'), CC_BRIDGE_CONFIG: path.join(tmp, 'config.json') })
 fs.mkdirSync(process.env.CC_BRIDGE_DATA_DIR, { mode: 0o700 })
 const { addPending, claimPending, finishPending, beginHandover, releaseClaim, readPending, pendingFile, cancelPending, bindPending } = await import('../lib/pending.js')

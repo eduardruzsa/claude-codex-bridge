@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add macOS support with native process identity and open-file checks, kernel-held locks, and Terminal.app launching. Requires Xcode Command Line Tools on first use.
+- Keep bridge socket paths short on macOS and remove the GNU `readlink` requirement.
+- Run the test suite on Linux and macOS with Node 22 and the latest LTS.
+
+
 ## 0.5.0 — first public release
 
 - Requests for an agent that is still starting get an id and timestamp at once, and survive a slow approval, an interrupted handover or a closed window. After a conversation change they are recorded as dropped, never rerouted.

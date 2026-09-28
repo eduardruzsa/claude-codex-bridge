@@ -1,2 +1,4 @@
 node_modules/
 .install.lock
+
+.native/

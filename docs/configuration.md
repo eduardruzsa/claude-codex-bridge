@@ -12,7 +12,7 @@ cc-bridge config set <key> <value>
 |---|---|---|---|
 | `claude_bin` | `"claude"` | Claude Code command | `CC_BRIDGE_CLAUDE_BIN` |
 | `codex_bin` | `"codex"` | Codex command | `CC_BRIDGE_CODEX_BIN` |
-| `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses `xdg-terminal-exec` | `CC_BRIDGE_TERMINAL` (space-separated) |
+| `terminal` | `null` | Terminal that opens a missing agent, as argv, e.g. `["kitty", "--directory", "{cwd}", "--title", "{title}"]`. `null` uses Terminal.app on macOS and `xdg-terminal-exec` on Linux | `CC_BRIDGE_TERMINAL` (space-separated) |
 | `default_label` | `"claude"` | Label of a `claude-live` session; when taken, the next free `<label>-2`, `<label>-3`, … is used | `CC_BRIDGE_LABEL` (exact label, no fallback) |
 | `data_dir` | `null` | Pairings, transcript, token; use a directory only the bridge uses. `null`: `~/.local/share/cc-bridge` | `CC_BRIDGE_DATA_DIR` |
 | `runtime_dir` | `null` | Sockets and launch state; use a directory only the bridge uses. `null`: `$XDG_RUNTIME_DIR/cc-bridge` | `CC_BRIDGE_RUNTIME_DIR` |
@@ -62,3 +62,11 @@ cc-bridge install        # adds the Codex Stop hook
 The Claude hook ships in the plugin and follows the config right away. The Codex side needs a `Stop` hook in `~/.codex/hooks.json`, which `cc-bridge install` adds only while `review_codex_plans` is on (and removes when it is off). Codex asks you once to trust the new hook ("hooks need review", or run `/hooks`); until then, Codex plans go unreviewed. `cc-bridge doctor` shows the trust status.
 
 `CC_BRIDGE_PLAN_REVIEW=0` or `=1` overrides the config for one session, but `=1` can't activate a Codex hook that isn't installed.
+
+## macOS
+
+The first run compiles `native/macos.c` into the clone's ignored `.native/` directory using `/usr/bin/cc`. Install Apple's Command Line Tools with `xcode-select --install` first. The helper reads precise process start times and open rollout files with libproc, and argv with sysctl; it never uses a shell to parse process arguments. Kernel `flock` locks release when their helper exits, including when the owning Node process is killed. Lock files remain in private directories and must not be deleted while the bridge runs.
+
+Terminal.app is the default launcher. Allow the launching app to control Terminal.app in System Settings → Privacy & Security → Automation when macOS prompts. A denied request is recorded as a failed launch; after granting access, use `cc-bridge retry <message-id>`. Custom terminal argv works on both platforms.
+
+The default socket directory is `/tmp/cc-bridge-<uid>/cc-bridge`, with user-only permissions, so Claude and Codex agree even when their `TMPDIR` values differ. Custom socket paths must fit macOS's 103-byte limit (including the label and `.sock`). Avoid long runtime paths.

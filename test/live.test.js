@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import { consultArgs } from '../lib/common.js'
 
 test('real consultation: no hooks, read-only tools, writes blocked', { skip: process.env.CC_BRIDGE_LIVE !== '1' }, () => {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-live-'))
+  const cwd = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-live-'))
   const args = consultArgs().map(a => (a === 'json' ? 'stream-json' : a))
   args.push('--verbose')
   const run = spawnSync('claude', args, {

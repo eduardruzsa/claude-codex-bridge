@@ -9,7 +9,7 @@ import { after, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-plan-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-plan-'))
 after(() => fs.rmSync(tmp, { recursive: true, force: true }))
 const calls = path.join(tmp, 'calls.jsonl')
 

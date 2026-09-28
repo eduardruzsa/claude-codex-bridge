@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { openRolloutThreads } from './lib/platform.js'
 // Codex side of the bridge: an MCP server Codex launches over stdio.
 // Sends to the paired live Claude session's channel socket, answers Claude
 // messages (which arrive in Codex via `codex queue`), and runs separate
@@ -121,23 +122,7 @@ const fail = t => ({ content: [{ type: 'text', text: t }], isError: true })
 // Codex thread identity comes from the Codex host, not the model: every tools/call
 // carries _meta.threadId for the calling thread. As a second check it must be a thread
 // whose rollout-<ts>-<uuid>.jsonl the Codex process that launched us holds open.
-function openCodexThreads() {
-  const threads = new Set()
-  const fdDir = `/proc/${process.ppid}/fd`
-  let fds = []
-  try {
-    fds = fs.readdirSync(fdDir)
-  } catch {
-    return threads
-  }
-  for (const fd of fds) {
-    try {
-      const m = fs.readlinkSync(`${fdDir}/${fd}`).match(/\/rollout-[^/]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
-      if (m) threads.add(m[1].toLowerCase())
-    } catch {}
-  }
-  return threads
-}
+const openCodexThreads = () => openRolloutThreads(process.ppid)
 
 function turnMetadata(meta) {
   const raw = meta?.['x-codex-turn-metadata']

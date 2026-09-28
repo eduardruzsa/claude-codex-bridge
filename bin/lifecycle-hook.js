@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { withMutex } from '../lib/platform.js'
+import { runtimeDir } from '../lib/common.js'
 import { updateState } from '../lib/lifecycle.js'
 import { channelActive, findClaudeProcess, lifecycleDirFor } from '../lib/claude-process.js'
 
@@ -20,7 +22,9 @@ if (dir === '--plugin') {
 }
 try {
   if (!path.isAbsolute(dir) || !fs.statSync(dir).isDirectory()) throw new Error('missing launcher state')
-  if (locked === '--locked') {
+  if (process.platform === 'darwin') {
+    await withMutex(`lifecycle:${dir}`, path.join(runtimeDir(), 'locks'), () => updateState(dir, JSON.parse(input), order), 2000)
+  } else if (locked === '--locked') {
     updateState(dir, JSON.parse(input), originalOrder)
   } else {
     // The kernel releases this lock even if a hook is killed. No stale-lock deletion.

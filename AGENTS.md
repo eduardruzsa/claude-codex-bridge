@@ -4,7 +4,7 @@ Instructions for coding agents working on this repository. Human contributors: s
 
 ## What this is
 
-A local, two-way bridge between Claude Code and Codex. Linux only: it relies on `/proc` and abstract Unix sockets.
+A local, two-way bridge between Claude Code and Codex. Supports Linux and macOS. Linux uses `/proc` and abstract Unix sockets; macOS uses the small `native/macos.c` helper (libproc, sysctl, and flock), built with Xcode Command Line Tools.
 
 - **Claude side:** a Claude Code plugin (this repository is its marketplace). `claude-channel.js` is an MCP server with the `claude/channel` capability. It stays dormant unless Claude was started through `bin/claude-live`.
 - **Codex side:** `codex-mcp.js`, an MCP server registered with `codex mcp add`. Messages to Codex go through `codex queue --thread <id>`.
@@ -19,6 +19,8 @@ A local, two-way bridge between Claude Code and Codex. Linux only: it relies on 
 | `bin/claude-live` | `claude --dangerously-load-development-channels plugin:cc-bridge@cc-bridge` wrapper |
 | `bin/agent-launch.js` | Runs inside a launched terminal and tracks the agent process |
 | `bin/plan-review`, `bin/lifecycle-hook.js`, `bin/plugin-start` | Hook and plugin entry points (`hooks/hooks.json`, `.mcp.json`) |
+| `lib/platform.js`, `native/macos.c` | OS process inspection and kernel locks |
+| `bin/mac-terminal.js` | Terminal.app launcher with private launch requests |
 | `lib/config.js` | The config file schema; no imports from the rest of `lib/` |
 | `lib/common.js` | Paths, pairings, transcript, socket protocol |
 | `lib/pending.js`, `lib/launch-state.js`, `lib/recovery.js`, `lib/store.js` | Waiting requests, launch reservations, retry, locked JSON stores |
@@ -56,7 +58,7 @@ These are the bridge's safety properties. Changes that weaken them need an expli
 - Every suite isolates itself: temporary `CC_BRIDGE_DATA_DIR`, `CC_BRIDGE_RUNTIME_DIR` and `CC_BRIDGE_CONFIG`, a fake `CC_BRIDGE_TERMINAL`, `CC_BRIDGE_CLAUDE_PROC=none`, and a temporary `CODEX_HOME` or `HOME` wherever Codex or Claude files could be touched. New tests must do the same. Tests must never read or write the real `~/.codex`, `~/.claude` or `~/.config/cc-bridge`.
 - For a bug fix, first write a test that fails on the old code, then fix it.
 - For state-machine or race fixes, assert on the recorded events in the transcript rather than on timing.
-- CI runs on Node 22 (the minimum, per `package.json` `engines`) and on the latest LTS. Keep both working.
+- CI runs on Linux and macOS with Node 22 (the minimum, per `package.json` `engines`) and the latest LTS. Keep all four jobs working.
 
 ## Conventions
 
@@ -68,5 +70,5 @@ These are the bridge's safety properties. Changes that weaken them need an expli
 
 ## Git and pull requests
 
-- `main` is protected. Work on a branch and open a pull request; merges are squash-only and need both CI jobs green. Never force-push to `main`.
+- `main` is protected. Work on a branch and open a pull request; merges are squash-only and need all CI jobs green. Never force-push to `main`.
 - Write commit messages that say what changed and why. Keep one change per pull request.

@@ -9,7 +9,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { install, minimumNode, supportedNode, root, shQuote, uninstall } from '../lib/admin.js'
 import { transition } from '../lib/lifecycle.js'
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-ux-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-ux-'))
 process.env.CC_BRIDGE_RUNTIME_DIR = path.join(tmp, 'run')
 process.env.CC_BRIDGE_DATA_DIR = path.join(tmp, 'data')
 process.env.CC_BRIDGE_CLAUDE_PROC = 'none' // isolate from the Claude session running the tests

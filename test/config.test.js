@@ -11,7 +11,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-config-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-config-'))
 after(() => fs.rmSync(tmp, { recursive: true, force: true }))
 for (const k of Object.keys(process.env)) if (/^(CC_BRIDGE|CLAUDE|CODEX)/.test(k)) delete process.env[k]
 const { SCHEMA, config, defaultsJson, initConfig, loadConfig, setConfig } = await import('../lib/config.js')
@@ -75,7 +75,9 @@ test('terminal: argv from the file with placeholders, or a space-split env strin
   assert.deepEqual(terminalCommand('/p', 'T'), ['foot', '-e'])
   delete process.env.CC_BRIDGE_TERMINAL
   withConfig()
-  assert.deepEqual(terminalCommand('/p', 'T'), ['xdg-terminal-exec', '--dir=/p', '--title=T'])
+  assert.deepEqual(terminalCommand('/p', 'T'), process.platform === 'darwin'
+    ? [process.execPath, path.join(root, 'bin/mac-terminal.js'), '/p', 'T']
+    : ['xdg-terminal-exec', '--dir=/p', '--title=T'])
 })
 
 test('config init never overwrites; set validates and keeps other keys', () => {

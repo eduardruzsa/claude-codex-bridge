@@ -28,3 +28,15 @@ Offline coverage lives in `test/reliability.test.js` and `test/bridge.test.js`. 
 5. Delay Claude's channel approval specifically. Check whether the host retains pre-approval notifications. Regardless of the observed result, retain the unconfirmed status until a reply; the transport itself supplies no receipt acknowledgement.
 
 These checks use model quota and host approval prompts. Offline fake-agent tests cannot establish how the real host handles notifications before approval.
+
+## macOS port verification (2026-09-28)
+
+On an Apple Silicon Mac with Node 26.10.0:
+
+- Full offline suite: 81 passed, zero failed; the opt-in live model test was skipped.
+- Covered both messaging directions, host-owned thread identity, duplicate rejection, label contention, stale socket recovery, lifecycle changes, pending claims, and launch recovery with isolated fake agents.
+- Added platform tests for stable process identity, exact argv, per-process open rollout files, kernel lock contention and recovery after SIGKILL, and safe terminal argv/environment handoffs.
+- The native helper compiles with `-Wall -Wextra -Werror` and uses only macOS system libraries.
+- Compiled the Terminal.app AppleScript and launched a harmless file-writing command in a real Terminal.app window successfully.
+
+The suite needs permission to bind local Unix sockets; a sandbox that denies socket binding cannot run the end-to-end tests. CI now covers Linux and macOS on Node 22 and the latest LTS. Real Claude/Codex model conversations and notification approval behavior still need the live checks above before release; offline tests and the Terminal smoke test do not establish those host behaviors.

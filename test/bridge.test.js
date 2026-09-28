@@ -14,7 +14,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ccb-'))
+const tmp = fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'ccb-'))
 const THREAD = '11111111-2222-3333-4444-555555555555'
 const OTHER_THREAD = '99999999-2222-3333-4444-555555555555'
 const T3 = '33333333-2222-3333-4444-555555555555'
@@ -335,8 +335,12 @@ test('a live label owner is never displaced, even if unresponsive', async () => 
   assert.ok((await codex.call('send_to_claude', { text: 'still there?', as_thread: THREAD })).ok)
 
   // A stalled owner: holds the label, answers nothing.
-  const stalled = spawn('node', ['-e', `require('net').createServer().listen(${JSON.stringify(labelMutexName('t5'))}, () => console.log('held')); setInterval(() => {}, 1000)`])
-  await new Promise(r => stalled.stdout.once('data', r))
+  const stalled = spawn(process.execPath, ['--input-type=module', '-e', `import { acquireMutex } from ${JSON.stringify(new URL('../lib/platform.js', import.meta.url).href)}; await acquireMutex(${JSON.stringify(labelMutexName('t5'))}, ${JSON.stringify(path.join(env.CC_BRIDGE_RUNTIME_DIR, 'locks'))}); console.log('held'); setInterval(() => {}, 1000)`])
+  await new Promise((resolve, reject) => {
+    stalled.stdout.once('data', resolve)
+    stalled.once('error', reject)
+    stalled.once('exit', code => reject(new Error(`stalled fixture exited ${code}`)))
+  })
   const late = await startClaude('t5', 'claude-sess-late')
   await new Promise(r => setTimeout(r, 300))
   assert.match((await late.call('bridge_status')).text, /NOT listening: another live Claude session/)
@@ -528,8 +532,8 @@ test('the channel is dormant unless Claude was started with it', async () => {
 
   const { launchedWithChannel, sweepLifecycleDirs } = await import('../lib/claude-process.js')
   // Lifecycle state is swept only once its Claude process (pid + start time) has ended.
-  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8')
-  const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]
+  const { processIdentity } = await import('../lib/store.js')
+  const { start } = processIdentity()
   const live = path.join(env.CC_BRIDGE_RUNTIME_DIR, `proc-${process.pid}-${start}`)
   const gone = path.join(env.CC_BRIDGE_RUNTIME_DIR, `proc-${process.pid}-1`)
   for (const d of [live, gone]) fs.mkdirSync(d, { recursive: true })

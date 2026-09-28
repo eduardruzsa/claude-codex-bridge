@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+import { acquireMutex } from './lib/platform.js'
 // Claude Code side of the bridge: a two-way Claude Channel, shipped as the cc-bridge
 // plugin's MCP server. It loads in every Claude session but stays dormant (no tools,
 // no socket) unless Claude was started with the channel (bin/claude-live). Codex
 // messages arrive on a user-only Unix socket and are pushed into the session as
 // <channel source="cc-bridge" ...> events.
 import fs from 'node:fs'
+import path from 'node:path'
 import net from 'node:net'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -19,6 +21,7 @@ import {
   pairLive,
   parseParty,
   paths,
+  runtimeDir,
   record,
   validLabel,
   validateReply,
@@ -342,15 +345,15 @@ function serve(conn) {
 
 class LabelTaken extends Error {}
 
-// Exclusive ownership of a label: a Linux abstract-namespace socket bound only as a
-// mutex (name from labelMutexName). The kernel allows one binder and releases it when
-// the process dies, so there is no stale lock to recover and no read-then-delete race.
-function acquireLabel(name) {
-  const mutex = net.createServer(c => c.destroy())
-  return new Promise((resolve, reject) => {
-    mutex.once('error', err => reject(err.code === 'EADDRINUSE' ? new LabelTaken(`another live Claude session already uses label "${name}"`) : err))
-    mutex.listen(labelMutexName(name), () => resolve(mutex))
-  })
+
+// Kernel-held ownership: abstract socket on Linux, flock on macOS.
+async function acquireLabel(name) {
+  try {
+    return await acquireMutex(labelMutexName(name), path.join(runtimeDir(), 'locks'))
+  } catch (err) {
+    if (err.code === 'EADDRINUSE') throw new LabelTaken(`another live Claude session already uses label "${name}"`)
+    throw err
+  }
 }
 
 // The conversation id to match pairings against when choosing a label: the lifecycle
@@ -394,7 +397,7 @@ function socketIsDead(sockPath) {
       probe.destroy()
       resolve(false)
     })
-    probe.on('error', err => resolve(['ENOENT', 'ECONNREFUSED'].includes(err.code)))
+    probe.on('error', err => resolve(['ENOENT', 'ECONNREFUSED', 'ENOTSOCK'].includes(err.code)))
   })
 }
 
